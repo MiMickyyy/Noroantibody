@@ -1,0 +1,42 @@
+structure: fold_2026_03_12_12_19_model_0.cif
+antigen_chains: [A, B]
+nanobody_chain: C
+
+cdrs:
+  cdr1: [23, 34]
+  cdr2: [50, 58]
+  cdr3: [97, 106]
+
+contact_cutoffs:
+  heavy_atom: 4.5
+  hydrogen_bond_distance: 3.5
+  hydrogen_bond_angle: 120.0
+  salt_bridge: 4.0
+  hydrophobic: 4.5
+  aromatic: 5.0
+
+patch_clustering_distance: 6.0
+
+interface_score_weights:
+  contact: 1.0
+  hbond: 2.0
+  salt_bridge: 2.5
+  hydrophobic: 1.2
+  aromatic: 1.5
+  multi_cdr_bonus: 2.0
+  cdr3_bonus: 1.5
+
+# Optional numbering mapping. Use one of:
+# 1) mode: offset
+#    offset: 0
+# 2) mode: csv
+#    file: residue_map.csv
+numbering_map:
+  mode: csv
+  file: residue_map.csv
+
+# Published hotspot sets (typically full-length numbering if mapping is provided).
+published_hotspots:
+  epitope_A: [294, 295, 296, 297, 298, 368, 372, 373]
+  epitope_D: [391, 393, 394, 395, 396]
+  hbga_adjacent: [343, 344, 345, 347, 374, 390, 391, 392, 393, 394, 395, 442, 443, 444]

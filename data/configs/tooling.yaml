@@ -1,0 +1,26 @@
+execute_real_tools: false
+
+rfdiffusion:
+  command_prefix: "AUTO_DETECT_FROM_REPO_AND_ENV"
+  run_cwd: ""
+  notes: "Autodetect script will resolve real command prefix if available."
+
+proteinmpnn:
+  command_prefix: "AUTO_DETECT_FROM_REPO_AND_ENV"
+  run_cwd: ""
+  notes: "Autodetect script will resolve real command prefix if available."
+
+rf2:
+  command_prefix: "AUTO_DETECT_FROM_REPO_AND_ENV"
+  run_cwd: ""
+  notes: "Autodetect script will resolve real command prefix if available."
+
+checkpoints:
+  rfdiffusion_weights: "AUTO_DETECT_FROM_REPO_AND_ENV"
+  proteinmpnn_weights: "AUTO_DETECT_FROM_REPO_AND_ENV"
+  rf2_weights: "AUTO_DETECT_FROM_REPO_AND_ENV"
+
+cli_args_reference:
+  rfdiffusion: "AUTO_DETECT_FROM_REPO_AND_ENV"
+  proteinmpnn: "AUTO_DETECT_FROM_REPO_AND_ENV"
+  rf2: "AUTO_DETECT_FROM_REPO_AND_ENV"

@@ -1,0 +1,14 @@
+name: noro_rfantibody
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - biopython>=1.83
+  - pandas>=2.0
+  - pyyaml>=6.0
+  - numpy>=1.24
+  - requests>=2.31
+  - scipy>=1.10
+  - pip:
+      - typer>=0.12

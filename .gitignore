@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+
+logs/
+phase0_smoke/
+phase1_coarse_pilot/
+phase2_focused_pilot/
+phase3_main_campaign/
+phase4_h2_refine/
+results/
+
+# Keep config/templates and source data mapping
+data/raw/
+!data/raw/.gitkeep
+data/processed/
+!data/processed/.gitkeep
+data/target/
+!data/target/.gitkeep
+data/maps/
+!data/maps/.gitkeep

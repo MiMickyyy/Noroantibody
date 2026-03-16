@@ -1,0 +1,5 @@
+loop_design:
+  round1_design_loops: [H1, H3]
+  fixed_loops_round1: [H2]
+  h1_length_deltas: [-1, 0, 1]
+  h3_length_deltas: [-2, -1, 0, 1, 2]

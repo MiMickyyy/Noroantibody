@@ -1,0 +1,51 @@
+project:
+  name: "norovirus_chdc2094_nanobody_redesign"
+  random_seed: 20260316
+  gpu:
+    type: "NVIDIA_L4"
+    count: 1
+
+inputs:
+  vp1_sequence_file: "VP1.prot"
+  p_domain_dimer_sequence_file: "P-domain dimer.fasta"
+  nanobody_sequence_file: "Nanobody.fasta"
+  # Required for real RFantibody execution (RFdiffusion --framework).
+  # Put your nanobody framework structure path here (PDB/mmCIF), e.g. "data/raw/my_framework.pdb".
+  nanobody_framework_pdb_file: ""
+  # Optional local structure override. If empty, downloader will fetch 5IYN biological assembly 1.
+  local_antigen_structure_file: ""
+
+target_prep:
+  rcsb_id: "5IYN"
+  biological_assembly: 1
+  antigen_chain_ids: [A, B]
+  crop_window_full_length: [285, 445]
+  hotspot_context_radius_angstrom: 10.0
+  crop_gap_merge_max: 2
+  crop_segment_padding: 2
+
+execution:
+  dry_run_default: true
+  resume_default: true
+  limited_batch_debug_default: null
+  max_gpu_parallel_jobs: 1
+  fail_fast: false
+
+filters:
+  hard_thresholds:
+    rf2_pae_max: 10.0
+    design_rf2_rmsd_max: 2.0
+  ranking_weights:
+    rf2_self_consistency: 0.40
+    hotspot_agreement: 0.25
+    docking_localization: 0.20
+    structural_plausibility: 0.10
+    h1_h3_role_consistency: 0.05
+
+postprocess:
+  sequence_dedup_identity_threshold: 0.95
+  structural_clustering_enabled: false
+
+af3_handoff:
+  export_top_n: 25
+  include_antigen_context_files: true

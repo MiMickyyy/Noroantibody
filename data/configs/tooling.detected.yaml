@@ -1,0 +1,64 @@
+execute_real_tools: false
+rfdiffusion:
+  command_prefix: []
+  run_cwd: null
+  detected_mode: unresolved
+proteinmpnn:
+  command_prefix: []
+  run_cwd: null
+  detected_mode: unresolved
+rf2:
+  command_prefix: []
+  run_cwd: null
+  detected_mode: unresolved
+checkpoints:
+  rfdiffusion_weights: null
+  proteinmpnn_weights: null
+  rf2_weights: null
+cli_args_reference:
+  rfdiffusion:
+    entrypoint: rfantibody.cli.inference:rfdiffusion
+    required:
+    - --target
+    - --framework
+    common:
+    - --output
+    - --output-quiver
+    - --num-designs
+    - --design-loops
+    - --hotspots
+    - --weights
+    - --diffuser-t
+    - --final-step
+    - --deterministic
+    - --no-trajectory
+    - --extra
+  proteinmpnn:
+    entrypoint: rfantibody.cli.inference:proteinmpnn
+    required:
+    - --input-dir or --input-quiver
+    common:
+    - --output-dir
+    - --output-quiver
+    - --loops
+    - --seqs-per-struct
+    - --temperature
+    - --weights
+    - --omit-aas
+    - --augment-eps
+    - --deterministic
+    - --debug
+    - --allow-x
+  rf2:
+    entrypoint: rfantibody.cli.inference:rf2
+    required:
+    - --input-pdb/--input-dir/--input-quiver/--input-json
+    - --output-dir or --output-quiver
+    common:
+    - --num-recycles
+    - --weights
+    - --seed
+    - --cautious
+    - --hotspot-show-prop
+    - --extra
+rfantibody_repo: /Users/mickysmacbookpro/Downloads/Norovirus/data/framework/external/RFantibody

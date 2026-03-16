@@ -1,0 +1,7 @@
+nanobody_chain_id: C
+cdr_boundaries:
+  H1: [23, 34]
+  H2: [50, 58]
+  H3: [97, 106]
+annotation_scheme: "USER_DEFINED"
+notes: "User-provided authoritative boundaries (normalized to valid YAML punctuation)."

@@ -1,0 +1,32 @@
+phases:
+  phase0_smoke:
+    description: "End-to-end smoke test on 1 campaign x 1 H1 x 1 H3"
+    campaign_count: 1
+    h1_delta_subset: [0]
+    h3_delta_subset: [0]
+    backbones_per_combination: 1
+    sequences_per_backbone: 1
+  phase1_coarse_pilot:
+    description: "45 combinations, 8 backbones each, 1 sequence per backbone"
+    campaign_count: all
+    h1_delta_subset: all
+    h3_delta_subset: all
+    backbones_per_combination: 8
+    sequences_per_backbone: 1
+  phase2_focused_pilot:
+    description: "Top 8 combinations from phase1, 25 backbones each, 2 seq per backbone"
+    input_from_phase: phase1_coarse_pilot
+    input_top_combinations: 8
+    backbones_per_combination: 25
+    sequences_per_backbone: 2
+  phase3_main_campaign:
+    description: "Top 2 combinations from phase2, 150 backbones each, 2 seq per backbone"
+    input_from_phase: phase2_focused_pilot
+    input_top_combinations: 2
+    backbones_per_combination: 150
+    sequences_per_backbone: 2
+  phase4_h2_refine:
+    description: "H2 sequence-only optimization for top 25 phase3 candidates"
+    input_from_phase: phase3_main_campaign
+    input_top_candidates: 25
+    h2_variants_per_candidate: 4

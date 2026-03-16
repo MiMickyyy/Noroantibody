@@ -1,0 +1,10 @@
+campaigns:
+  campaign_A_core:
+    description: "A-core anchors"
+    hotspot_full_length_residues: [294, 297, 298, 368, 372]
+  campaign_B_A_plus_D_rim_bridge:
+    description: "A + D-rim bridge anchors"
+    hotspot_full_length_residues: [297, 298, 368, 391, 394]
+  campaign_C_A_plus_pocket_rim_HBGA_adjacent:
+    description: "A + pocket-rim / HBGA-adjacent extension anchors"
+    hotspot_full_length_residues: [297, 298, 368, 374, 443]
