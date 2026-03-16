@@ -308,6 +308,16 @@ def normalize_scan_roots(project_root: Path, extra: List[str]) -> List[Path]:
     return dedup
 
 
+def resolve_optional_path(root: Path, value: str) -> Optional[Path]:
+    token = str(value or "").strip()
+    if not token:
+        return None
+    p = Path(token).expanduser()
+    if not p.is_absolute():
+        p = (root / p).resolve()
+    return p
+
+
 def main() -> int:
     args = parse_args()
     root = Path(".").resolve()
@@ -317,8 +327,10 @@ def main() -> int:
     resolved_inputs_cfg = read_yaml(root / args.resolved_inputs)
     resolved_inputs = resolved_inputs_cfg.get("resolved_inputs", {})
 
-    nanobody_alias = Path(resolved_inputs.get("nanobody_sequence_file", ""))
-    nanobody_seq = read_sequence(nanobody_alias) if nanobody_alias.exists() else ""
+    nanobody_alias = resolve_optional_path(root, str(resolved_inputs.get("nanobody_sequence_file", "")))
+    nanobody_seq = ""
+    if nanobody_alias is not None and nanobody_alias.exists() and nanobody_alias.is_file():
+        nanobody_seq = read_sequence(nanobody_alias)
     detected_chain = detect_nanobody_chain(root / args.complex_structure, nanobody_seq)
 
     runtime = detect_runtime()
@@ -387,7 +399,7 @@ def main() -> int:
         "rfantibody_repo": str(repo_root) if repo_root else None,
         "chain_detection": {
             "complex_structure": str(root / args.complex_structure),
-            "nanobody_alias": str(nanobody_alias),
+            "nanobody_alias": str(nanobody_alias) if nanobody_alias else "",
             "detected_chain": detected_chain,
             "chain_in_cdr_config": chain_in_cfg,
             "nanobody_length": len(nanobody_seq),
