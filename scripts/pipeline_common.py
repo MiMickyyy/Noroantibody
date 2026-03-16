@@ -12,6 +12,7 @@ import shlex
 import subprocess
 import time
 from dataclasses import dataclass
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -211,6 +212,101 @@ def run_command(
         )
         handle.write(f"Exit code: {proc.returncode}\n")
         return int(proc.returncode)
+
+
+def sanitize_pdb_for_rfantibody(src: Path, dst: Path) -> Dict[str, int]:
+    """Sanitize PDB atom records for RFantibody parsers.
+
+    Rules:
+    - Keep `ATOM` records only (drop `HETATM` and `ANISOU`).
+    - Keep altloc `' '` and `'A'`; normalize kept altloc to `' '`.
+    - De-duplicate by (chain, resseq, icode, atom name), keeping first entry.
+    - Preserve non-coordinate records (including REMARK/TER/END) as-is.
+    """
+    if not src.exists():
+        raise PipelineError(f"Cannot sanitize missing PDB file: {src}")
+
+    lines = src.read_text(encoding="utf-8", errors="ignore").splitlines()
+    out_lines: List[str] = []
+    seen_atom_keys = set()
+    backbone_atoms = defaultdict(set)  # key=(chain,resseq,icode) -> {"N","CA","C"}
+    residue_keys = set()
+
+    stats = {
+        "atoms_in": 0,
+        "atoms_kept": 0,
+        "dropped_altloc": 0,
+        "dropped_duplicate_atom_records": 0,
+        "dropped_hetatm": 0,
+        "dropped_anisou": 0,
+        "dropped_malformed": 0,
+        "residues_total": 0,
+        "residues_missing_backbone": 0,
+    }
+
+    for raw in lines:
+        line = raw.rstrip("\n")
+        rec = line[:6]
+
+        if rec.startswith("ATOM"):
+            stats["atoms_in"] += 1
+            if len(line) < 54:
+                stats["dropped_malformed"] += 1
+                continue
+
+            # PDB fixed columns: altLoc is column 17 (0-based index 16).
+            altloc = line[16] if len(line) > 16 else " "
+            if altloc not in (" ", "A"):
+                stats["dropped_altloc"] += 1
+                continue
+
+            chain = line[21] if len(line) > 21 else " "
+            resseq = line[22:26] if len(line) > 25 else "    "
+            icode = line[26] if len(line) > 26 else " "
+            atom_name = line[12:16] if len(line) > 15 else "    "
+            atom_key = (chain, resseq, icode, atom_name)
+
+            if atom_key in seen_atom_keys:
+                stats["dropped_duplicate_atom_records"] += 1
+                continue
+            seen_atom_keys.add(atom_key)
+
+            residue_key = (chain, resseq, icode)
+            residue_keys.add(residue_key)
+            atom_trim = atom_name.strip().upper()
+            if atom_trim in {"N", "CA", "C"}:
+                backbone_atoms[residue_key].add(atom_trim)
+
+            # Normalize altLoc for kept atoms.
+            norm = line if len(line) >= 80 else line.ljust(80)
+            if altloc != " ":
+                norm = norm[:16] + " " + norm[17:]
+
+            out_lines.append(norm.rstrip())
+            stats["atoms_kept"] += 1
+            continue
+
+        if rec.startswith("HETATM"):
+            stats["dropped_hetatm"] += 1
+            continue
+
+        if rec.startswith("ANISOU"):
+            stats["dropped_anisou"] += 1
+            continue
+
+        out_lines.append(line)
+
+    missing_backbone = [
+        key for key in residue_keys if not {"N", "CA", "C"}.issubset(backbone_atoms.get(key, set()))
+    ]
+    stats["residues_total"] = len(residue_keys)
+    stats["residues_missing_backbone"] = len(missing_backbone)
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dst.with_suffix(dst.suffix + ".tmp")
+    tmp_path.write_text("\n".join(out_lines).rstrip() + "\n", encoding="utf-8")
+    tmp_path.replace(dst)
+    return stats
 
 
 def atomic_write_csv(path: Path, rows: List[dict], fieldnames: Sequence[str]):

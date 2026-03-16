@@ -20,8 +20,10 @@ from Bio.PDB.Polypeptide import is_aa, protein_letters_3to1
 from pipeline_common import (
     PipelineError,
     deterministic_rng,
+    now_str,
     read_yaml,
     run_command,
+    sanitize_pdb_for_rfantibody,
 )
 
 AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
@@ -241,6 +243,51 @@ def _best_rf2_pdb(output_dir: Path, input_stem: str) -> Optional[Path]:
     return cands[0] if cands else None
 
 
+def _append_log_line(log_path: Path, message: str):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{now_str()}] {message}\n")
+
+
+def _sanitize_input_pdb_for_rfdiffusion(src: Path, role: str, log_file: Path) -> Path:
+    if src.suffix.lower() != ".pdb":
+        _append_log_line(
+            log_file,
+            f"[WARN] {role} input is not .pdb ({src}); skipping sanitizer and passing original path.",
+        )
+        return src
+
+    clean_path = src.with_name(f"{src.stem}.rfab_clean.pdb")
+    if clean_path.exists() and clean_path.stat().st_mtime >= src.stat().st_mtime:
+        return clean_path
+
+    stats = sanitize_pdb_for_rfantibody(src, clean_path)
+    _append_log_line(
+        log_file,
+        (
+            f"Sanitized {role} input for RFantibody: src={src} clean={clean_path} "
+            f"atoms_in={stats['atoms_in']} atoms_kept={stats['atoms_kept']} "
+            f"dropped_altloc={stats['dropped_altloc']} "
+            f"dropped_duplicates={stats['dropped_duplicate_atom_records']} "
+            f"residues_missing_backbone={stats['residues_missing_backbone']}"
+        ),
+    )
+    if stats["residues_missing_backbone"] > 0:
+        raise PipelineError(
+            f"{role} input has {stats['residues_missing_backbone']} residues missing N/CA/C after sanitization: "
+            f"{clean_path}"
+        )
+    return clean_path
+
+
+def _log_contains_any(log_file: Path, patterns: Sequence[str]) -> bool:
+    if not log_file.exists():
+        return False
+    text = log_file.read_text(encoding="utf-8", errors="ignore")
+    lowered = text.lower()
+    return any(p.lower() in lowered for p in patterns)
+
+
 def run_rfdiffusion_backbone(
     cfg: ToolConfig,
     combo: dict,
@@ -278,62 +325,90 @@ def run_rfdiffusion_backbone(
     if not framework_pdb.exists():
         raise PipelineError(f"Missing framework PDB for RFdiffusion: {framework_pdb}")
 
+    safe_target_pdb = _sanitize_input_pdb_for_rfdiffusion(target_pdb, role="target", log_file=log_file)
+    safe_framework_pdb = _sanitize_input_pdb_for_rfdiffusion(framework_pdb, role="framework", log_file=log_file)
+
     h1_len = int(combo["h1_length"])
     h2_len = int(combo.get("h2_length", 0))
     h3_len = int(combo["h3_length"])
     if h2_len <= 0:
         raise PipelineError("H2 length must be available in combo for RFantibody RFdiffusion")
 
-    cmd = list(cfg.rfdiffusion_prefix)
     out_prefix = str(out_pdb.with_suffix(""))
 
-    if _is_cli_prefix(cmd, "rfdiffusion"):
-        cmd += [
-            "--target",
-            str(target_pdb),
-            "--framework",
-            str(framework_pdb),
-            "--output",
-            out_prefix,
-            "--num-designs",
-            "1",
-            "--design-loops",
-            f"H1:{h1_len},H2:{h2_len},H3:{h3_len}",
-            "--diffuser-t",
-            "50",
-            "--final-step",
-            "1",
-            "--deterministic",
-            "--no-trajectory",
-        ]
-        if hotspots:
-            cmd += ["--hotspots", ",".join(hotspots)]
-        if cfg.rfdiffusion_weights:
-            cmd += ["--weights", str(cfg.rfdiffusion_weights)]
-    elif _is_script_prefix(cmd, "rfdiffusion_inference.py"):
-        cmd += [
-            "--config-name",
-            "antibody",
-            f"antibody.target_pdb={str(target_pdb)}",
-            f"antibody.framework_pdb={str(framework_pdb)}",
-            f"inference.output_prefix={out_prefix}",
-            "inference.num_designs=1",
-            f"antibody.design_loops=[H1:{h1_len},H2:{h2_len},H3:{h3_len}]",
-            "diffuser.T=50",
-            "inference.final_step=1",
-            "inference.deterministic=True",
-            "inference.no_trajectory=True",
-        ]
-        if hotspots:
-            cmd.append(f"ppi.hotspot_res=[{','.join(hotspots)}]")
-        if cfg.rfdiffusion_weights:
-            cmd.append(f"inference.ckpt_override_path={str(cfg.rfdiffusion_weights)}")
-    else:
+    def build_cmd(*, deterministic: bool, diffuser_t: int) -> List[str]:
+        cmd = list(cfg.rfdiffusion_prefix)
+        if _is_cli_prefix(cmd, "rfdiffusion"):
+            cmd += [
+                "--target",
+                str(safe_target_pdb),
+                "--framework",
+                str(safe_framework_pdb),
+                "--output",
+                out_prefix,
+                "--num-designs",
+                "1",
+                "--design-loops",
+                f"H1:{h1_len},H2:{h2_len},H3:{h3_len}",
+                "--diffuser-t",
+                str(diffuser_t),
+                "--final-step",
+                "1",
+                "--no-trajectory",
+            ]
+            if deterministic:
+                cmd.append("--deterministic")
+            if hotspots:
+                cmd += ["--hotspots", ",".join(hotspots)]
+            if cfg.rfdiffusion_weights:
+                cmd += ["--weights", str(cfg.rfdiffusion_weights)]
+            return cmd
+
+        if _is_script_prefix(cmd, "rfdiffusion_inference.py"):
+            cmd += [
+                "--config-name",
+                "antibody",
+                f"antibody.target_pdb={str(safe_target_pdb)}",
+                f"antibody.framework_pdb={str(safe_framework_pdb)}",
+                f"inference.output_prefix={out_prefix}",
+                "inference.num_designs=1",
+                f"antibody.design_loops=[H1:{h1_len},H2:{h2_len},H3:{h3_len}]",
+                f"diffuser.T={diffuser_t}",
+                "inference.final_step=1",
+                "inference.write_trajectory=False",
+            ]
+            if deterministic:
+                cmd.append("inference.deterministic=True")
+            if hotspots:
+                cmd.append(f"ppi.hotspot_res=[{','.join(hotspots)}]")
+            if cfg.rfdiffusion_weights:
+                cmd.append(f"inference.ckpt_override_path={str(cfg.rfdiffusion_weights)}")
+            return cmd
+
         raise PipelineError(
             "Unsupported rfdiffusion command prefix. Expected CLI 'rfdiffusion' or script 'rfdiffusion_inference.py'."
         )
 
+    cmd = build_cmd(deterministic=True, diffuser_t=50)
     code = run_command(cmd, log_path=log_file, dry_run=False, cwd=cfg.rfdiffusion_cwd)
+    if code != 0 and _log_contains_any(
+        log_file,
+        patterns=[
+            "non-positive determinant",
+            "left-handed or null coordinate frame",
+            "rotation matrix",
+        ],
+    ):
+        _append_log_line(
+            log_file,
+            (
+                "Detected RFdiffusion rotation-frame instability. "
+                "Retrying once with deterministic=False and diffuser_t=200 for stability."
+            ),
+        )
+        retry_cmd = build_cmd(deterministic=False, diffuser_t=200)
+        code = run_command(retry_cmd, log_path=log_file, dry_run=False, cwd=cfg.rfdiffusion_cwd)
+
     if code != 0:
         raise PipelineError(f"RFdiffusion command failed for {backbone_id}; see {log_file}")
 

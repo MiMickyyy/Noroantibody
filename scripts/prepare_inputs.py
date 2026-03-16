@@ -25,6 +25,10 @@ DEFAULT_CANDIDATES = {
 
 OPTIONAL_CANDIDATES = {
     "nanobody_framework_pdb_file": [
+        "Nanobody.pdb",
+        "nanobody.pdb",
+        "Nanobody_framework_HLT.pdb",
+        "nanobody_framework_hlt.pdb",
         "Nanobody_framework.pdb",
         "Nanobody-framework.pdb",
         "nanobody_framework.pdb",

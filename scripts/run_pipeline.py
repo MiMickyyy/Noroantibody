@@ -180,6 +180,16 @@ def require_file(path: Path, hint: str):
         raise PipelineError(f"Missing required file: {path}. {hint}")
 
 
+def resolve_path_like(root: Path, value: str) -> Optional[Path]:
+    token = str(value).strip()
+    if not token:
+        return None
+    p = Path(token).expanduser()
+    if not p.is_absolute():
+        p = root / p
+    return p.resolve()
+
+
 def load_base_context(args: argparse.Namespace) -> dict:
     root = Path(".").resolve()
     pipeline_cfg = read_yaml(root / args.pipeline_config)
@@ -196,10 +206,29 @@ def load_base_context(args: argparse.Namespace) -> dict:
     resolved_inputs = read_yaml(resolved_inputs_path).get("resolved_inputs", {})
     resolved_targets = read_yaml(resolved_targets_path)
 
+    # Normalize known path-like fields to absolute paths for robust execution
+    for key in (
+        "vp1_sequence_file",
+        "p_domain_dimer_sequence_file",
+        "nanobody_sequence_file",
+        "nanobody_framework_pdb_file",
+    ):
+        val = str(resolved_inputs.get(key, "")).strip()
+        if val:
+            resolved = resolve_path_like(root, val)
+            if resolved is not None:
+                resolved_inputs[key] = str(resolved)
+    for key in ("full_cleaned_target", "cropped_design_target", "mapping_table", "crop_report"):
+        val = str(resolved_targets.get(key, "")).strip()
+        if val:
+            resolved = resolve_path_like(root, val)
+            if resolved is not None:
+                resolved_targets[key] = str(resolved)
+
     cdr = load_cdr_boundaries(root / args.cdr_config)
 
-    nanobody_path = Path(resolved_inputs.get("nanobody_sequence_file", ""))
-    if not nanobody_path.exists():
+    nanobody_path = resolve_path_like(root, resolved_inputs.get("nanobody_sequence_file", ""))
+    if nanobody_path is None or not nanobody_path.exists():
         raise PipelineError(
             f"Resolved nanobody sequence alias missing: {nanobody_path}. "
             "Run scripts/prepare_inputs.py and check aliases."
@@ -212,18 +241,22 @@ def load_base_context(args: argparse.Namespace) -> dict:
     ).strip()
     framework_pdb: Optional[Path] = None
     if framework_cfg:
-        framework_pdb = (root / framework_cfg).resolve()
-        if not framework_pdb.exists():
+        framework_pdb = resolve_path_like(root, framework_cfg)
+        if framework_pdb is None or not framework_pdb.exists():
             raise PipelineError(
                 f"Configured nanobody framework PDB does not exist: {framework_pdb}. "
                 "Please set inputs.nanobody_framework_pdb_file to a valid structure."
             )
 
-    cropped_target = Path(resolved_targets.get("cropped_design_target", ""))
-    mapping_table = Path(resolved_targets.get("mapping_table", ""))
-    if not cropped_target.exists():
+    cropped_target = resolve_path_like(root, resolved_targets.get("cropped_design_target", ""))
+    mapping_table = resolve_path_like(root, resolved_targets.get("mapping_table", ""))
+    if cropped_target is None or not cropped_target.exists():
         raise PipelineError(
             f"Resolved cropped target missing: {cropped_target}. Run scripts/prepare_targets.py first."
+        )
+    if mapping_table is None or not mapping_table.exists():
+        raise PipelineError(
+            f"Resolved mapping table missing: {mapping_table}. Run scripts/prepare_targets.py first."
         )
     chain_order = list(pipeline_cfg.get("target_prep", {}).get("antigen_chain_ids", ["A", "B"]))
     chain_segs = target_chain_segments(cropped_target)

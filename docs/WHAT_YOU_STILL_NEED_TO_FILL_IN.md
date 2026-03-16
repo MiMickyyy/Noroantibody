@@ -5,6 +5,7 @@ This study is a computational structural modeling and protein design project foc
 
 1. Configure validated CDR boundaries in `data/configs/cdr_boundaries.yaml`.
 2. Set `inputs.nanobody_framework_pdb_file` in `data/configs/pipeline.yaml` to a valid framework PDB/mmCIF path.
+   - For RFantibody RFdiffusion, framework must be HLT-compatible and include chain `H` (and optional `L`).
 3. Confirm input sequence file paths in `data/configs/pipeline.yaml`.
 4. Run `python scripts/prepare_inputs.py`.
 5. Run `python scripts/autodetect_runtime_and_tooling.py --strict` and inspect unresolved fields.

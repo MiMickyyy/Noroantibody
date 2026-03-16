@@ -174,6 +174,12 @@ python scripts/run_pipeline.py --phase phase3_main_campaign
 python scripts/run_pipeline.py --phase phase4_h2_refine
 ```
 
+If your `resolved_targets.yaml` contains relative paths, rerun target prep first so paths are rewritten to absolute:
+
+```bash
+python scripts/prepare_targets.py
+```
+
 When real tool commands are configured, force non-dry execution:
 
 ```bash
@@ -324,6 +330,26 @@ Set:
 - `execute_real_tools: true`
 
 before production runs.
+
+## RFdiffusion troubleshooting (important)
+
+If RFdiffusion crashes with errors like:
+- `Non-positive determinant (left-handed or null coordinate frame)`
+
+this is usually caused by alternate-location (`altLoc`) duplicate atoms in PDB inputs (commonly duplicate `CA` records).
+
+This pipeline now sanitizes RFdiffusion inputs automatically by:
+- removing `HETATM`/`ANISOU`
+- keeping altloc ` ` and `A` only
+- de-duplicating `(chain, resnum, icode, atom)` records
+- writing cached `*.rfab_clean.pdb` files next to the original PDBs
+
+If needed, regenerate targets and retry:
+
+```bash
+python scripts/prepare_targets.py
+python scripts/run_pipeline.py --phase phase0_smoke --execute --no-resume
+```
 
 ## What you still need to fill in
 

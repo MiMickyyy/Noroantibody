@@ -26,6 +26,7 @@ from pipeline_common import (
     read_json,
     read_sequence_file,
     read_yaml,
+    sanitize_pdb_for_rfantibody,
     write_json,
     write_yaml,
 )
@@ -273,6 +274,18 @@ def main() -> int:
 
     full_cleaned_path = root / "data/target/antigen_full_cleaned_AB.pdb"
     write_structure_subset(model, full_cleaned_path, chains=chain_ids)
+    full_clean_stats = sanitize_pdb_for_rfantibody(full_cleaned_path, full_cleaned_path)
+    if full_clean_stats["dropped_duplicate_atom_records"] > 0 or full_clean_stats["dropped_altloc"] > 0:
+        warnings.append(
+            "Full cleaned target had duplicate/altloc atoms; sanitized for RFantibody compatibility "
+            f"(dropped_altloc={full_clean_stats['dropped_altloc']}, "
+            f"dropped_duplicates={full_clean_stats['dropped_duplicate_atom_records']})."
+        )
+    if full_clean_stats["residues_missing_backbone"] > 0:
+        raise PipelineError(
+            "Full cleaned target contains residues missing backbone atoms (N/CA/C) after sanitization: "
+            f"{full_clean_stats['residues_missing_backbone']} residues."
+        )
     clean_model = parse_structure(full_cleaned_path)
 
     records_by_chain = chain_residue_records(clean_model, chain_ids)
@@ -362,6 +375,18 @@ def main() -> int:
 
     cropped_path = root / "data/target/antigen_top_cap_cropped_AB.pdb"
     write_structure_subset(clean_model, cropped_path, chains=chain_ids, allowed_keys=allowed_crop_keys)
+    cropped_clean_stats = sanitize_pdb_for_rfantibody(cropped_path, cropped_path)
+    if cropped_clean_stats["dropped_duplicate_atom_records"] > 0 or cropped_clean_stats["dropped_altloc"] > 0:
+        warnings.append(
+            "Cropped target had duplicate/altloc atoms; sanitized for RFantibody compatibility "
+            f"(dropped_altloc={cropped_clean_stats['dropped_altloc']}, "
+            f"dropped_duplicates={cropped_clean_stats['dropped_duplicate_atom_records']})."
+        )
+    if cropped_clean_stats["residues_missing_backbone"] > 0:
+        raise PipelineError(
+            "Cropped target contains residues missing backbone atoms (N/CA/C) after sanitization: "
+            f"{cropped_clean_stats['residues_missing_backbone']} residues."
+        )
 
     map_rows = []
     for chain_id in chain_ids:
@@ -405,6 +430,8 @@ def main() -> int:
         "crop_ranges_structure_resnum": crop_ranges,
         "hotspot_full_length_union": hotspots_full,
         "mapping_rows": len(map_rows),
+        "full_clean_sanitize_stats": full_clean_stats,
+        "cropped_sanitize_stats": cropped_clean_stats,
         "warnings": warnings,
         "p_domain_sequence_name": pdom_name,
         "p_domain_length": len(pdom_monomer),
