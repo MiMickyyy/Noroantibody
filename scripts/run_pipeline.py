@@ -857,6 +857,14 @@ def run_phase_design(
                 "mean_ranking_score": 0.0,
             }
         else:
+            uniq_seq = int(df["full_sequence"].nunique()) if "full_sequence" in df.columns else 0
+            uniq_rank = int(df["ranking_score"].nunique()) if "ranking_score" in df.columns else 0
+            if int(df.shape[0]) > 1 and uniq_seq <= 1 and uniq_rank <= 1:
+                log(
+                    f"[WARN] {combo.combination_id} produced no candidate diversity "
+                    f"(unique_sequences={uniq_seq}, unique_ranking_scores={uniq_rank}). "
+                    "Check deterministic settings and seed strategy."
+                )
             summary = {
                 "phase": phase_name,
                 "combination_id": combo.combination_id,

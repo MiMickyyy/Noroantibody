@@ -389,7 +389,9 @@ def run_rfdiffusion_backbone(
             "Unsupported rfdiffusion command prefix. Expected CLI 'rfdiffusion' or script 'rfdiffusion_inference.py'."
         )
 
-    cmd = build_cmd(deterministic=True, diffuser_t=50)
+    # Do not force deterministic sampling in production phases; diversity across
+    # backbones is required for meaningful per-combination ranking.
+    cmd = build_cmd(deterministic=False, diffuser_t=50)
     code = run_command(cmd, log_path=log_file, dry_run=False, cwd=cfg.rfdiffusion_cwd)
     if code != 0 and _log_contains_any(
         log_file,
@@ -493,7 +495,6 @@ def run_proteinmpnn_sequence_design(
             str(seqs_per_struct),
             "--temperature",
             str(temperature),
-            "--deterministic",
         ]
         if cfg.proteinmpnn_weights:
             cmd += ["--weights", str(cfg.proteinmpnn_weights)]
@@ -509,7 +510,6 @@ def run_proteinmpnn_sequence_design(
             str(seqs_per_struct),
             "-temperature",
             str(temperature),
-            "-deterministic",
         ]
         if cfg.proteinmpnn_weights:
             cmd += ["-checkpoint_path", str(cfg.proteinmpnn_weights)]
@@ -588,6 +588,10 @@ def run_rf2_filter(
     rf2_out_dir = out_json.parent / f"{out_json.stem}_rf2_outputs"
     rf2_out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Keep reproducibility while avoiding identical RF2 seeds for every candidate.
+    seed_key = str(context.get("candidate_id", input_pdb.stem))
+    rf2_seed = deterministic_rng(seed, f"rf2::{seed_key}").randint(1, 2_000_000_000)
+
     cmd = list(cfg.rf2_prefix)
 
     if _is_cli_prefix(cmd, "rf2"):
@@ -601,7 +605,7 @@ def run_rf2_filter(
             "--hotspot-show-prop",
             "0.1",
             "--seed",
-            str(seed),
+            str(rf2_seed),
             "--cautious",
         ]
         if cfg.rf2_weights:
@@ -613,7 +617,7 @@ def run_rf2_filter(
             "inference.num_recycles=10",
             "inference.cautious=True",
             "inference.hotspot_show_proportion=0.1",
-            f"+inference.seed={seed}",
+            f"+inference.seed={rf2_seed}",
         ]
         if cfg.rf2_weights:
             cmd += [f"model.model_weights={str(cfg.rf2_weights)}"]
