@@ -174,6 +174,10 @@ python scripts/run_pipeline.py --phase phase3_main_campaign
 python scripts/run_pipeline.py --phase phase4_h2_refine
 ```
 
+Manual Phase2 combination override (optional):
+- File: `data/configs/phase2_selected_combinations.yaml`
+- If present and `enabled: true`, Phase2 uses `selected_combination_ids` instead of `results/summaries/phase1_top8_combinations.csv`.
+
 If your `resolved_targets.yaml` contains relative paths, rerun target prep first so paths are rewritten to absolute:
 
 ```bash

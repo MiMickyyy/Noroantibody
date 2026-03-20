@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,6 +159,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cdr-config", default="data/configs/cdr_boundaries.yaml")
     parser.add_argument("--resolved-inputs", default="data/processed/resolved_inputs.yaml")
     parser.add_argument("--resolved-targets", default="data/processed/resolved_targets.yaml")
+    parser.add_argument(
+        "--phase2-selection-config",
+        default="data/configs/phase2_selected_combinations.yaml",
+        help=(
+            "Optional manual phase2 selection YAML. If present and enabled, "
+            "selected_combination_ids overrides phase1_top8_combinations.csv."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--execute",
@@ -205,6 +214,15 @@ def load_base_context(args: argparse.Namespace) -> dict:
 
     resolved_inputs = read_yaml(resolved_inputs_path).get("resolved_inputs", {})
     resolved_targets = read_yaml(resolved_targets_path)
+
+    phase2_selection_path = root / args.phase2_selection_config
+    phase2_manual_selection_ids: List[str] = []
+    if phase2_selection_path.exists():
+        phase2_cfg = read_yaml(phase2_selection_path)
+        enabled = bool(phase2_cfg.get("enabled", True))
+        ids = phase2_cfg.get("selected_combination_ids", [])
+        if enabled and isinstance(ids, list):
+            phase2_manual_selection_ids = [str(x).strip() for x in ids if str(x).strip()]
 
     # Normalize known path-like fields to absolute paths for robust execution
     for key in (
@@ -277,6 +295,8 @@ def load_base_context(args: argparse.Namespace) -> dict:
         "framework_pdb": str(framework_pdb) if framework_pdb else "",
         "rfdiffusion_target_contig": target_contig,
         "campaign_hotspot_tokens": campaign_hotspots,
+        "phase2_selection_path": str(phase2_selection_path),
+        "phase2_manual_selection_ids": phase2_manual_selection_ids,
     }
 
 
@@ -374,6 +394,23 @@ def residue_has_contact(res_a, res_b, cutoff: float) -> bool:
     return False
 
 
+def compute_backbone_signature(pdb_path: Path) -> str:
+    """Return a stable content hash for a generated backbone PDB."""
+    if not pdb_path.exists():
+        return ""
+    h = hashlib.md5()
+    try:
+        with pdb_path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1 << 20)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except Exception:
+        return ""
+    return h.hexdigest()
+
+
 def compute_interface_heuristics(
     pdb_path: Path,
     parts: dict,
@@ -396,7 +433,10 @@ def compute_interface_heuristics(
         return metrics
 
     parser = PDBParser(QUIET=True)
-    model = next(parser.get_structure("candidate", str(pdb_path)).get_models())
+    try:
+        model = next(parser.get_structure("candidate", str(pdb_path)).get_models())
+    except Exception:
+        return metrics
 
     chain_residues: Dict[str, List] = {}
     for chain in model.get_chains():
@@ -525,6 +565,8 @@ def combos_for_phase(
     phase_cfg: dict,
     all_combos: List[Combination],
     root: Path,
+    phase2_manual_ids: Optional[List[str]] = None,
+    phase2_selection_path: Optional[Path] = None,
 ) -> List[Combination]:
     if phase_name == "phase0_smoke":
         campaigns = sorted(set(c.campaign_name for c in all_combos))
@@ -540,6 +582,29 @@ def combos_for_phase(
         return all_combos
 
     if phase_name == "phase2_focused_pilot":
+        if phase2_manual_ids:
+            unique_ids: List[str] = []
+            seen = set()
+            for cid in phase2_manual_ids:
+                if cid not in seen:
+                    unique_ids.append(cid)
+                    seen.add(cid)
+
+            combo_map = {c.combination_id: c for c in all_combos}
+            missing = [cid for cid in unique_ids if cid not in combo_map]
+            if missing:
+                source = phase2_selection_path if phase2_selection_path else Path("<manual>")
+                raise PipelineError(
+                    f"Manual phase2 selection contains unknown combination IDs in {source}: {missing}"
+                )
+            if len(unique_ids) != 8:
+                source = phase2_selection_path if phase2_selection_path else Path("<manual>")
+                log(
+                    f"[WARN] Manual phase2 selection has {len(unique_ids)} combinations in {source}; "
+                    "the approved plan expects 8."
+                )
+            return [combo_map[cid] for cid in unique_ids]
+
         prev = root / "results/summaries/phase1_top8_combinations.csv"
         require_file(prev, "Run phase1_coarse_pilot first.")
         ids = set(pd.read_csv(prev)["combination_id"].astype(str).tolist())
@@ -656,6 +721,15 @@ def run_phase_design(
         ensure_dirs([metrics_dir, seq_aux_dir, backbone_dir])
 
         backbones = load_or_empty_csv(backbones_csv)
+        backbones_changed = False
+        for bb in backbones:
+            sig = str(bb.get("backbone_signature", "")).strip()
+            if sig:
+                continue
+            bb_pdb_existing = Path(str(bb.get("backbone_pdb", "")).strip())
+            bb["backbone_signature"] = compute_backbone_signature(bb_pdb_existing)
+            backbones_changed = True
+
         existing_backbone_ids = {x["backbone_id"] for x in backbones}
 
         # stage 1: backbone generation
@@ -689,11 +763,18 @@ def run_phase_design(
                     "campaign_name": combo.campaign_name,
                     "backbone_id": bb_id,
                     "backbone_pdb": str(bb_pdb),
+                    "backbone_signature": compute_backbone_signature(bb_pdb),
                 }
             )
             existing_backbone_ids.add(bb_id)
 
-        write_rows(backbones_csv, backbones, ["combination_id", "campaign_name", "backbone_id", "backbone_pdb"])
+        if backbones_changed:
+            log(f"[{phase_name}] Refreshed missing backbone signatures for {combo.combination_id}.")
+        write_rows(
+            backbones_csv,
+            backbones,
+            ["combination_id", "campaign_name", "backbone_id", "backbone_pdb", "backbone_signature"],
+        )
 
         # stage 2+3: sequence generation + RF2 filtering
         candidates = load_or_empty_csv(candidates_csv)
@@ -789,6 +870,7 @@ def run_phase_design(
                     "h3_length": combo.h3_length,
                     "backbone_id": bb_id,
                     "backbone_pdb": str(bb_pdb),
+                    "backbone_signature": str(bb.get("backbone_signature", "")),
                     "candidate_id": cid,
                     "designed_pdb": str(designed_pdb),
                     "rf2_best_pdb": str(metrics.get("rf2_best_pdb", "")),
@@ -822,6 +904,7 @@ def run_phase_design(
             "h3_length",
             "backbone_id",
             "backbone_pdb",
+            "backbone_signature",
             "candidate_id",
             "designed_pdb",
             "rf2_best_pdb",
@@ -853,18 +936,37 @@ def run_phase_design(
                 "h3_length": combo.h3_length,
                 "total_candidates": 0,
                 "hard_pass_candidates": 0,
+                "unique_sequences": 0,
+                "unique_ranking_scores": 0,
+                "unique_backbone_signatures": 0,
                 "best_ranking_score": 0.0,
                 "mean_ranking_score": 0.0,
             }
         else:
             uniq_seq = int(df["full_sequence"].nunique()) if "full_sequence" in df.columns else 0
             uniq_rank = int(df["ranking_score"].nunique()) if "ranking_score" in df.columns else 0
-            if int(df.shape[0]) > 1 and uniq_seq <= 1 and uniq_rank <= 1:
+            if "backbone_signature" in df.columns:
+                sig_col = df["backbone_signature"].fillna("").astype(str).str.strip()
+                known_backbone_sigs = int(sig_col.ne("").sum())
+                uniq_backbone_sig = int(sig_col[sig_col.ne("")].nunique())
+            else:
+                known_backbone_sigs = 0
+                uniq_backbone_sig = 0
+            no_candidate_div = int(df.shape[0]) > 1 and uniq_seq <= 1 and uniq_rank <= 1
+            no_backbone_div = known_backbone_sigs > 1 and uniq_backbone_sig <= 1
+            if no_candidate_div or no_backbone_div:
                 log(
-                    f"[WARN] {combo.combination_id} produced no candidate diversity "
-                    f"(unique_sequences={uniq_seq}, unique_ranking_scores={uniq_rank}). "
-                    "Check deterministic settings and seed strategy."
+                    f"[WARN] {combo.combination_id} diversity issue "
+                    f"(unique_sequences={uniq_seq}, unique_ranking_scores={uniq_rank}, "
+                    f"unique_backbone_signatures={uniq_backbone_sig}, known_backbone_signatures={known_backbone_sigs}). "
+                    "Check deterministic settings and seed strategy for RFdiffusion/ProteinMPNN/RF2."
                 )
+                if phase_name in {"phase2_focused_pilot", "phase3_main_campaign"}:
+                    raise PipelineError(
+                        f"{phase_name} combination {combo.combination_id} failed diversity checks "
+                        f"(unique_sequences={uniq_seq}, unique_ranking_scores={uniq_rank}, "
+                        f"unique_backbone_signatures={uniq_backbone_sig})."
+                    )
             summary = {
                 "phase": phase_name,
                 "combination_id": combo.combination_id,
@@ -873,6 +975,9 @@ def run_phase_design(
                 "h3_length": combo.h3_length,
                 "total_candidates": int(df.shape[0]),
                 "hard_pass_candidates": int(df["hard_filter_pass"].sum()),
+                "unique_sequences": uniq_seq,
+                "unique_ranking_scores": uniq_rank,
+                "unique_backbone_signatures": uniq_backbone_sig,
                 "best_ranking_score": float(df["ranking_score"].max()),
                 "mean_ranking_score": float(df["ranking_score"].mean()),
                 "mean_rf2_pae": float(df["rf2_pae"].mean()),
@@ -915,6 +1020,9 @@ def run_phase_design(
         "h3_length",
         "total_candidates",
         "hard_pass_candidates",
+        "unique_sequences",
+        "unique_ranking_scores",
+        "unique_backbone_signatures",
         "best_ranking_score",
         "mean_ranking_score",
         "mean_rf2_pae",
@@ -1459,7 +1567,16 @@ def run_single_phase(phase_name: str, context: dict, args: argparse.Namespace):
     )
 
     if phase_name in {"phase0_smoke", "phase1_coarse_pilot", "phase2_focused_pilot", "phase3_main_campaign"}:
-        combos = combos_for_phase(phase_name, phase_cfg, all_combos, context["root"])
+        combos = combos_for_phase(
+            phase_name,
+            phase_cfg,
+            all_combos,
+            context["root"],
+            phase2_manual_ids=context.get("phase2_manual_selection_ids", []),
+            phase2_selection_path=Path(context["phase2_selection_path"])
+            if context.get("phase2_selection_path")
+            else None,
+        )
         if not combos:
             raise PipelineError(f"No combinations selected for {phase_name}.")
         run_phase_design(phase_name=phase_name, combinations=combos, context=context, args=args)

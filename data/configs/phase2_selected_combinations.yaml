@@ -1,0 +1,12 @@
+enabled: true
+# Approved plan expects 8 combinations for phase2.
+# Current list reflects user-provided selections.
+selected_combination_ids:
+  - campaign_A_core_H113_H310
+  - campaign_A_core_H111_H39
+  - campaign_C_A_plus_pocket_rim_HBGA_adjacent_H112_H310
+  - campaign_C_A_plus_pocket_rim_HBGA_adjacent_H113_H311
+  - campaign_B_A_plus_D_rim_bridge_H112_H312
+  - campaign_A_core_H112_H38
+  - campaign_B_A_plus_D_rim_bridge_H112_H38
+  - campaign_B_A_plus_D_rim_bridge_H112_H310
