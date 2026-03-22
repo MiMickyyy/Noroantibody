@@ -167,6 +167,14 @@ def parse_args() -> argparse.Namespace:
             "selected_combination_ids overrides phase1_top8_combinations.csv."
         ),
     )
+    parser.add_argument(
+        "--phase3-selection-config",
+        default="data/configs/phase3_selected_combinations.yaml",
+        help=(
+            "Optional manual phase3 selection YAML. If present and enabled, "
+            "selected_combination_ids overrides phase2_top2_combinations.csv."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--execute",
@@ -223,6 +231,15 @@ def load_base_context(args: argparse.Namespace) -> dict:
         ids = phase2_cfg.get("selected_combination_ids", [])
         if enabled and isinstance(ids, list):
             phase2_manual_selection_ids = [str(x).strip() for x in ids if str(x).strip()]
+
+    phase3_selection_path = root / args.phase3_selection_config
+    phase3_manual_selection_ids: List[str] = []
+    if phase3_selection_path.exists():
+        phase3_cfg = read_yaml(phase3_selection_path)
+        enabled = bool(phase3_cfg.get("enabled", True))
+        ids = phase3_cfg.get("selected_combination_ids", [])
+        if enabled and isinstance(ids, list):
+            phase3_manual_selection_ids = [str(x).strip() for x in ids if str(x).strip()]
 
     # Normalize known path-like fields to absolute paths for robust execution
     for key in (
@@ -297,6 +314,8 @@ def load_base_context(args: argparse.Namespace) -> dict:
         "campaign_hotspot_tokens": campaign_hotspots,
         "phase2_selection_path": str(phase2_selection_path),
         "phase2_manual_selection_ids": phase2_manual_selection_ids,
+        "phase3_selection_path": str(phase3_selection_path),
+        "phase3_manual_selection_ids": phase3_manual_selection_ids,
     }
 
 
@@ -567,6 +586,8 @@ def combos_for_phase(
     root: Path,
     phase2_manual_ids: Optional[List[str]] = None,
     phase2_selection_path: Optional[Path] = None,
+    phase3_manual_ids: Optional[List[str]] = None,
+    phase3_selection_path: Optional[Path] = None,
 ) -> List[Combination]:
     if phase_name == "phase0_smoke":
         campaigns = sorted(set(c.campaign_name for c in all_combos))
@@ -611,6 +632,29 @@ def combos_for_phase(
         return [c for c in all_combos if c.combination_id in ids]
 
     if phase_name == "phase3_main_campaign":
+        if phase3_manual_ids:
+            unique_ids: List[str] = []
+            seen = set()
+            for cid in phase3_manual_ids:
+                if cid not in seen:
+                    unique_ids.append(cid)
+                    seen.add(cid)
+
+            combo_map = {c.combination_id: c for c in all_combos}
+            missing = [cid for cid in unique_ids if cid not in combo_map]
+            if missing:
+                source = phase3_selection_path if phase3_selection_path else Path("<manual>")
+                raise PipelineError(
+                    f"Manual phase3 selection contains unknown combination IDs in {source}: {missing}"
+                )
+            if len(unique_ids) != 2:
+                source = phase3_selection_path if phase3_selection_path else Path("<manual>")
+                log(
+                    f"[WARN] Manual phase3 selection has {len(unique_ids)} combinations in {source}; "
+                    "the approved plan expects 2."
+                )
+            return [combo_map[cid] for cid in unique_ids]
+
         prev = root / "results/summaries/phase2_top2_combinations.csv"
         require_file(prev, "Run phase2_focused_pilot first.")
         ids = set(pd.read_csv(prev)["combination_id"].astype(str).tolist())
@@ -1575,6 +1619,10 @@ def run_single_phase(phase_name: str, context: dict, args: argparse.Namespace):
             phase2_manual_ids=context.get("phase2_manual_selection_ids", []),
             phase2_selection_path=Path(context["phase2_selection_path"])
             if context.get("phase2_selection_path")
+            else None,
+            phase3_manual_ids=context.get("phase3_manual_selection_ids", []),
+            phase3_selection_path=Path(context["phase3_selection_path"])
+            if context.get("phase3_selection_path")
             else None,
         )
         if not combos:

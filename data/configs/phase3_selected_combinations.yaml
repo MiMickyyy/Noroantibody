@@ -1,0 +1,7 @@
+enabled: true
+# Approved plan expects 2 combinations for phase3.
+selected_combination_ids:
+  # 请把你最终选定的两个组合ID填在这里（可直接替换下面两行）
+  - campaign_B_A_plus_D_rim_bridge_H112_H39
+  - campaign_B_A_plus_D_rim_bridge_H111_H311
+
