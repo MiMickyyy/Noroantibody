@@ -260,6 +260,30 @@ python scripts/map_residue_numbers.py --chain A --full-length-resnum 297
 python scripts/export_af3_web_package.py
 ```
 
+## AF3 results -> RF2 re-score
+
+If you have AF3 web outputs in `AF3 Results/`, you can re-score those structures with RF2:
+
+```bash
+python scripts/rerank_af3_with_rf2.py \
+  --af3-results-dir "AF3 Results" \
+  --tooling-config data/configs/tooling.yaml \
+  --execute
+```
+
+Useful options:
+
+- `--model-indices 0` (default): run only AF3 `model_0` per job
+- `--model-indices all`: run all AF3 models found per job
+- `--no-resume`: force rerun even if RF2 JSON already exists
+- `--max-jobs N`: debug with first N jobs
+
+Outputs:
+
+- `results/summaries/af3_rf2_model_level.csv`
+- `results/summaries/af3_rf2_job_summary.csv`
+- `results/summaries/af3_rf2_ranked_designs_vs_wt.csv` (if WT is present)
+
 ## Phase plan (exact counts)
 
 - Phase 0:
