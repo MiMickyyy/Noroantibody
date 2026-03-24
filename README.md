@@ -174,6 +174,28 @@ python scripts/run_pipeline.py --phase phase3_main_campaign
 python scripts/run_pipeline.py --phase phase4_h2_refine
 ```
 
+Phase4 custom selected table (recommended when you manually pick 25 from phase3):
+
+```bash
+python scripts/run_pipeline.py \
+  --phase phase4_h2_refine \
+  --execute --resume
+```
+
+Default auto-detect order for Phase4 input CSV:
+- `phase3_selected.csv` (project root)
+- `results/summaries/phase3_selected.csv`
+- `results/summaries/phase3_top25_pre_h2.csv`
+
+You can still override explicitly with `--phase4-input-csv`.
+
+Accepted input shape:
+- full `phase3_top25_pre_h2.csv`, or
+- a custom CSV that at least contains `candidate_id`
+
+When only `candidate_id` is provided, the pipeline auto-fills required columns from
+`phase3_main_campaign/combinations/*/candidates.csv`.
+
 Manual Phase2 combination override (optional):
 - File: `data/configs/phase2_selected_combinations.yaml`
 - If present and `enabled: true`, Phase2 uses `selected_combination_ids` instead of `results/summaries/phase1_top8_combinations.csv`.

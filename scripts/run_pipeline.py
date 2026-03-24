@@ -189,6 +189,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--limit-per-combination", type=int, default=None)
     parser.add_argument("--max-combinations", type=int, default=None)
+    parser.add_argument(
+        "--phase4-input-csv",
+        default="__AUTO__",
+        help=(
+            "Input CSV for phase4 H2 optimization. "
+            "If omitted, auto-detect in order: "
+            "phase3_selected.csv (project root) -> "
+            "results/summaries/phase3_selected.csv -> "
+            "results/summaries/phase3_top25_pre_h2.csv. "
+            "Custom table must contain at least candidate_id."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -678,6 +690,246 @@ def load_or_empty_csv(path: Path) -> List[dict]:
 
 def write_rows(path: Path, rows: List[dict], field_order: List[str]):
     atomic_write_csv(path, rows, field_order)
+
+
+def cell_to_str(value) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def parse_int_maybe(value, default: int) -> int:
+    token = cell_to_str(value)
+    if not token:
+        return int(default)
+    try:
+        return int(token)
+    except ValueError:
+        try:
+            return int(float(token))
+        except ValueError:
+            return int(default)
+
+
+def infer_candidate_structure_paths(root: Path, row: Dict[str, object]) -> Dict[str, object]:
+    combo_id = cell_to_str(row.get("combination_id"))
+    backbone_id = cell_to_str(row.get("backbone_id"))
+    candidate_id = cell_to_str(row.get("candidate_id"))
+
+    phases = ["phase3_main_campaign", "phase2_focused_pilot", "phase1_coarse_pilot"]
+
+    if not cell_to_str(row.get("backbone_pdb")) and combo_id and backbone_id:
+        for phase_name in phases:
+            p = root / phase_name / "combinations" / combo_id / "backbones" / f"{backbone_id}.pdb"
+            if p.exists():
+                row["backbone_pdb"] = str(p)
+                break
+
+    seq_idx = None
+    m = re.search(r"_s(\d+)$", candidate_id)
+    if m:
+        seq_idx = max(0, int(m.group(1)) - 1)
+
+    if not cell_to_str(row.get("designed_pdb")) and combo_id and backbone_id and seq_idx is not None:
+        for phase_name in phases:
+            p = (
+                root
+                / phase_name
+                / "combinations"
+                / combo_id
+                / "mpnn_aux"
+                / backbone_id
+                / f"{backbone_id}_outputs"
+                / f"{backbone_id}_dldesign_{seq_idx}.pdb"
+            )
+            if p.exists():
+                row["designed_pdb"] = str(p)
+                break
+
+    if not cell_to_str(row.get("rf2_best_pdb")) and combo_id and candidate_id:
+        for phase_name in phases:
+            best_pdb = (
+                root
+                / phase_name
+                / "combinations"
+                / combo_id
+                / "rf2_metrics"
+                / f"{candidate_id}_rf2_rf2_outputs"
+                / f"{candidate_id}_best.pdb"
+            )
+            if best_pdb.exists():
+                row["rf2_best_pdb"] = str(best_pdb)
+                break
+
+            rf2_json = (
+                root
+                / phase_name
+                / "combinations"
+                / combo_id
+                / "rf2_metrics"
+                / f"{candidate_id}_rf2.json"
+            )
+            if rf2_json.exists():
+                try:
+                    data = read_json(rf2_json)
+                    rf2_best = cell_to_str(data.get("rf2_best_pdb"))
+                    if rf2_best:
+                        row["rf2_best_pdb"] = rf2_best
+                        break
+                except Exception:
+                    pass
+
+    if not cell_to_str(row.get("campaign_name")):
+        campaign = ""
+        if combo_id:
+            m = re.match(r"^(.*)_H1\d+_H3\d+$", combo_id)
+            if m:
+                campaign = m.group(1)
+        if campaign:
+            row["campaign_name"] = campaign
+
+    return row
+
+
+def load_phase4_input_rows(context: dict, args: argparse.Namespace) -> Tuple[List[dict], Path]:
+    root = context["root"]
+    framework_parts = split_framework_and_cdr(context["nanobody_seq"], context["cdr"])
+    phase4_token = cell_to_str(getattr(args, "phase4_input_csv", ""))
+    auto_mode = phase4_token in {"", "__AUTO__", "AUTO"}
+    if auto_mode:
+        auto_candidates = [
+            root / "phase3_selected.csv",
+            root / "results/summaries/phase3_selected.csv",
+            root / "results/summaries/phase3_top25_pre_h2.csv",
+        ]
+        phase4_input_path = next((p.resolve() for p in auto_candidates if p.exists()), None)
+        if phase4_input_path is None:
+            raise PipelineError(
+                "No phase4 input CSV found in auto-detect paths: "
+                "phase3_selected.csv, results/summaries/phase3_selected.csv, "
+                "results/summaries/phase3_top25_pre_h2.csv. "
+                "Please pass --phase4-input-csv explicitly."
+            )
+    else:
+        phase4_input_path = resolve_path_like(root, phase4_token)
+        if phase4_input_path is None:
+            raise PipelineError("--phase4-input-csv is empty.")
+        require_file(
+            phase4_input_path,
+            "Provide a valid phase4 input CSV path, or omit --phase4-input-csv for auto-detect.",
+        )
+
+    df = pd.read_csv(phase4_input_path)
+    if df.empty:
+        raise PipelineError(f"Phase4 input CSV is empty: {phase4_input_path}")
+    df = df.rename(columns={c: str(c).strip() for c in df.columns})
+    if "candidate_id" not in df.columns:
+        raise PipelineError(
+            f"Phase4 input CSV missing required column 'candidate_id': {phase4_input_path}"
+        )
+
+    phase3_by_candidate: Dict[str, dict] = {}
+    for phase_name in ["phase3_main_campaign", "phase2_focused_pilot", "phase1_coarse_pilot"]:
+        phase_rows = collect_phase_candidates(phase_name, root)
+        for row in phase_rows:
+            cid = cell_to_str(row.get("candidate_id"))
+            if cid and cid not in phase3_by_candidate:
+                phase3_by_candidate[cid] = row
+
+    merged_rows: List[dict] = []
+    seen: set = set()
+    unresolved: List[str] = []
+    for ridx, row in enumerate(df.to_dict(orient="records"), start=1):
+        cid = cell_to_str(row.get("candidate_id"))
+        if not cid:
+            unresolved.append(f"row {ridx}: empty candidate_id")
+            continue
+        if cid in seen:
+            log(f"[WARN] Phase4 input has duplicate candidate_id '{cid}'. Keeping first occurrence.")
+            continue
+        seen.add(cid)
+
+        merged: Dict[str, object] = dict(phase3_by_candidate.get(cid, {}))
+        for key, value in row.items():
+            k = str(key).strip()
+            v = cell_to_str(value)
+            if v:
+                merged[k] = v
+            elif k not in merged:
+                merged[k] = ""
+        merged["candidate_id"] = cid
+        merged = infer_candidate_structure_paths(root=root, row=merged)
+
+        h1_seq = cell_to_str(merged.get("h1_sequence"))
+        h3_seq = cell_to_str(merged.get("h3_sequence"))
+        if not cell_to_str(merged.get("h1_length")) and h1_seq:
+            merged["h1_length"] = len(h1_seq)
+        if not cell_to_str(merged.get("h3_length")) and h3_seq:
+            merged["h3_length"] = len(h3_seq)
+
+        # If H2 (or H1/H3) is absent in a custom selection table, recover it from full_sequence.
+        full_seq = cell_to_str(merged.get("full_sequence"))
+        if full_seq:
+            h1_len = parse_int_maybe(merged.get("h1_length"), len(h1_seq))
+            h3_len = parse_int_maybe(merged.get("h3_length"), len(h3_seq))
+            try:
+                h1_guess, h2_guess, h3_guess = split_designed_sequence(
+                    parts=framework_parts,
+                    full_seq=full_seq,
+                    h1_len=h1_len,
+                    h3_len=h3_len,
+                )
+                if not cell_to_str(merged.get("h1_sequence")):
+                    merged["h1_sequence"] = h1_guess
+                if not cell_to_str(merged.get("h2_sequence")):
+                    merged["h2_sequence"] = h2_guess
+                if not cell_to_str(merged.get("h3_sequence")):
+                    merged["h3_sequence"] = h3_guess
+                if not cell_to_str(merged.get("h1_length")):
+                    merged["h1_length"] = len(h1_guess)
+                if not cell_to_str(merged.get("h3_length")):
+                    merged["h3_length"] = len(h3_guess)
+            except Exception:
+                pass
+
+        missing: List[str] = []
+        for req in ["h1_sequence", "h2_sequence", "h3_sequence", "campaign_name"]:
+            if not cell_to_str(merged.get(req)):
+                missing.append(req)
+        if not args.dry_run:
+            if not (
+                cell_to_str(merged.get("rf2_best_pdb"))
+                or cell_to_str(merged.get("designed_pdb"))
+                or cell_to_str(merged.get("backbone_pdb"))
+            ):
+                missing.append("rf2_best_pdb|designed_pdb|backbone_pdb")
+
+        if missing:
+            unresolved.append(f"{cid}: missing {', '.join(missing)}")
+            continue
+        merged_rows.append(merged)
+
+    if unresolved:
+        head = "; ".join(unresolved[:6])
+        suffix = f" (+{len(unresolved) - 6} more)" if len(unresolved) > 6 else ""
+        raise PipelineError(
+            "Phase4 input rows unresolved. "
+            f"{head}{suffix}. "
+            "Provide candidate_id values that exist in phase3_main_campaign/combinations/*/candidates.csv, "
+            "or include all required fields directly."
+        )
+
+    if len(merged_rows) != 25:
+        log(
+            f"[WARN] Phase4 input has {len(merged_rows)} candidates (approved plan target is 25). Continuing."
+        )
+
+    return merged_rows, phase4_input_path
 
 
 def run_phase_design(
@@ -1213,12 +1465,8 @@ def run_phase4_h2_refine(context: dict, args: argparse.Namespace):
     phase_cfg = context["phases_cfg"]["phases"]["phase4_h2_refine"]
     tooling = context["tool_cfg"]
 
-    pre_h2_path = root / "results/summaries/phase3_top25_pre_h2.csv"
-    require_file(pre_h2_path, "Run phase3_main_campaign first.")
-
-    rows = pd.read_csv(pre_h2_path).to_dict(orient="records")
-    if len(rows) == 0:
-        raise PipelineError("phase3_top25_pre_h2.csv is empty.")
+    rows, pre_h2_path = load_phase4_input_rows(context=context, args=args)
+    log(f"[phase4_h2_refine] Loaded {len(rows)} parent candidates from: {pre_h2_path}")
 
     variants_n = int(phase_cfg.get("h2_variants_per_candidate", 4))
     seed_base = int(pipeline_cfg.get("project", {}).get("random_seed", 20260316)) + 404
@@ -1236,19 +1484,26 @@ def run_phase4_h2_refine(context: dict, args: argparse.Namespace):
     final_rows = []
     manifest_rows = []
     for row in rows:
-        parent_id = str(row["candidate_id"])
-        h1_seq_parent = str(row["h1_sequence"])
-        h2_parent = str(row["h2_sequence"])
-        h3_seq_parent = str(row["h3_sequence"])
-        parent_backbone = str(row.get("backbone_id", ""))
-        parent_backbone_pdb = str(row.get("backbone_pdb", ""))
-        campaign_name = str(row.get("campaign_name", ""))
-        h1_len = int(row.get("h1_length", len(h1_seq_parent)))
-        h3_len = int(row.get("h3_length", len(h3_seq_parent)))
+        parent_id = cell_to_str(row.get("candidate_id"))
+        h1_seq_parent = cell_to_str(row.get("h1_sequence"))
+        h2_parent = cell_to_str(row.get("h2_sequence"))
+        h3_seq_parent = cell_to_str(row.get("h3_sequence"))
+        parent_backbone = cell_to_str(row.get("backbone_id"))
+        parent_backbone_pdb = cell_to_str(row.get("backbone_pdb"))
+        campaign_name = cell_to_str(row.get("campaign_name"))
+        h1_len = parse_int_maybe(row.get("h1_length"), len(h1_seq_parent))
+        h3_len = parse_int_maybe(row.get("h3_length"), len(h3_seq_parent))
 
-        parent_input_pdb = Path(str(row.get("rf2_best_pdb", "")).strip() or str(row.get("designed_pdb", "")).strip() or parent_backbone_pdb)
-        if not parent_input_pdb.exists():
-            parent_input_pdb = Path(parent_backbone_pdb)
+        parent_input_pdb = (
+            resolve_path_like(root, cell_to_str(row.get("rf2_best_pdb")))
+            or resolve_path_like(root, cell_to_str(row.get("designed_pdb")))
+            or resolve_path_like(root, parent_backbone_pdb)
+        )
+        if parent_input_pdb is None:
+            if args.dry_run:
+                parent_input_pdb = root / "MISSING_PARENT_PDB_PLACEHOLDER.pdb"
+            else:
+                raise PipelineError(f"Phase4 requires a parent structure path for {parent_id}, but none was provided.")
         if not args.dry_run and not parent_input_pdb.exists():
             raise PipelineError(
                 f"Phase4 requires a real parent structure PDB. Missing for {parent_id}: {parent_input_pdb}"
@@ -1339,8 +1594,8 @@ def run_phase4_h2_refine(context: dict, args: argparse.Namespace):
                     "phase": "phase4_h2_refine",
                     "combination_id": row.get("combination_id", ""),
                     "campaign_name": campaign_name,
-                    "h1_length": row.get("h1_length", ""),
-                    "h3_length": row.get("h3_length", ""),
+                    "h1_length": h1_len,
+                    "h3_length": h3_len,
                     "parent_backbone_id": parent_backbone,
                     "parent_backbone_pdb": parent_backbone_pdb,
                     "designed_pdb": str(designed_pdb),
