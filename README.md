@@ -268,8 +268,12 @@ If you have AF3 web outputs in `AF3 Results/`, you can re-score those structures
 python scripts/rerank_af3_with_rf2.py \
   --af3-results-dir "AF3 Results" \
   --tooling-config data/configs/tooling.yaml \
+  --cdr-config data/configs/cdr_boundaries.yaml \
   --execute
 ```
+
+The script automatically converts AF3 models to RF2-compatible HLT-remarked PDBs
+(`H` nanobody + `T` target) and injects `H1/H2/H3` REMARK labels using your CDR config.
 
 Useful options:
 

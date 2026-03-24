@@ -23,7 +23,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 from Bio.PDB import MMCIFParser, PDBIO
 
-from pipeline_common import PipelineError, log, now_str, read_yaml, sanitize_pdb_for_rfantibody
+from pipeline_common import (
+    PipelineError,
+    load_cdr_boundaries,
+    log,
+    now_str,
+    read_yaml,
+    sanitize_pdb_for_rfantibody,
+)
 from tool_wrappers import load_tool_config, run_rf2_filter
 
 
@@ -32,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--af3-results-dir", default="AF3 Results")
     p.add_argument("--tooling-config", default="data/configs/tooling.yaml")
     p.add_argument("--pipeline-config", default="data/configs/pipeline.yaml")
+    p.add_argument("--cdr-config", default="data/configs/cdr_boundaries.yaml")
     p.add_argument("--job-map-csv", default="results/af3_web_exports/af3_26_jobs_map.csv")
     p.add_argument("--outdir", default="results/summaries")
     p.add_argument("--workdir", default="results/af3_rf2_rescore")
@@ -120,6 +128,109 @@ def list_model_cifs(job_dir: Path, wanted_indices: Optional[Sequence[int]]) -> L
         return found
     keep = set(int(x) for x in wanted_indices)
     return [(i, p) for (i, p) in found if i in keep]
+
+
+def _parse_atom_residue_key(line: str) -> Tuple[str, str, str]:
+    chain = line[21] if len(line) > 21 else " "
+    resseq = line[22:26] if len(line) > 25 else "    "
+    icode = line[26] if len(line) > 26 else " "
+    return chain, resseq, icode
+
+
+def _residue_counts_from_atom_lines(lines: Sequence[str]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    seen = set()
+    for line in lines:
+        if not line.startswith("ATOM"):
+            continue
+        chain, resseq, icode = _parse_atom_residue_key(line)
+        key = (chain, resseq, icode)
+        if key in seen:
+            continue
+        seen.add(key)
+        counts[chain] = counts.get(chain, 0) + 1
+    return counts
+
+
+def convert_clean_pdb_to_hlt_remarked(
+    clean_pdb: Path,
+    out_hlt_pdb: Path,
+    cdr_ranges: Dict[str, Tuple[int, int]],
+) -> Dict[str, object]:
+    """Convert a sanitized PDB into minimal HLT-remarked format for RF2.
+
+    Strategy:
+    - Identify nanobody chain as shortest chain by residue count -> map to H.
+    - Merge all remaining chains as target -> map to T.
+    - Reorder residues in output: all H residues first, then T residues.
+    - Renumber residues globally 1..N to satisfy RF2 remark indexing logic.
+    - Add H1/H2/H3 REMARK lines from configured CDR ranges.
+    """
+    src_lines = clean_pdb.read_text(encoding="utf-8", errors="ignore").splitlines()
+    atom_lines = [ln for ln in src_lines if ln.startswith("ATOM")]
+    if not atom_lines:
+        raise PipelineError(f"No ATOM lines found in {clean_pdb}")
+
+    chain_counts = _residue_counts_from_atom_lines(atom_lines)
+    if not chain_counts:
+        raise PipelineError(f"Could not infer chain residue counts from {clean_pdb}")
+
+    # Shortest chain is treated as nanobody chain.
+    nanobody_chain = sorted(chain_counts.items(), key=lambda kv: (kv[1], kv[0]))[0][0]
+
+    residue_order: List[Tuple[str, str, str]] = []
+    residue_atoms: Dict[Tuple[str, str, str], List[str]] = {}
+    for ln in atom_lines:
+        key = _parse_atom_residue_key(ln)
+        if key not in residue_atoms:
+            residue_atoms[key] = []
+            residue_order.append(key)
+        residue_atoms[key].append(ln.rstrip("\n"))
+
+    h_keys = [k for k in residue_order if k[0] == nanobody_chain]
+    t_keys = [k for k in residue_order if k[0] != nanobody_chain]
+    if not h_keys:
+        raise PipelineError(f"Failed to identify nanobody residues in {clean_pdb}")
+    if not t_keys:
+        raise PipelineError(f"Failed to identify target residues in {clean_pdb}")
+
+    new_order = h_keys + t_keys
+    key_to_new: Dict[Tuple[str, str, str], Tuple[str, int]] = {}
+    for i, key in enumerate(new_order, start=1):
+        new_chain = "H" if key[0] == nanobody_chain else "T"
+        key_to_new[key] = (new_chain, i)
+
+    out_lines: List[str] = []
+    serial = 1
+    for key in new_order:
+        new_chain, new_resnum = key_to_new[key]
+        for raw in residue_atoms[key]:
+            line = raw if len(raw) >= 80 else raw.ljust(80)
+            # Atom serial (cols 7-11), chain (col 22), resseq (cols 23-26), icode (col 27)
+            line = f"{line[:6]}{serial:5d}{line[11:]}"
+            line = line[:21] + new_chain + f"{new_resnum:4d}" + " " + line[27:]
+            out_lines.append(line.rstrip())
+            serial += 1
+
+    out_lines.append("TER")
+
+    h_len = len(h_keys)
+    # Add CDR remarks only if they fall within heavy-chain length after remap.
+    for loop_name in ("H1", "H2", "H3"):
+        start, end = cdr_ranges[loop_name]
+        for resi in range(start, end + 1):
+            if 1 <= resi <= h_len:
+                out_lines.append(f"REMARK PDBinfo-LABEL:{resi:5d} {loop_name}")
+    out_lines.append("REMARK AF3_TO_HLT_REMARKED")
+
+    out_hlt_pdb.parent.mkdir(parents=True, exist_ok=True)
+    out_hlt_pdb.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    return {
+        "nanobody_chain_original": nanobody_chain,
+        "chain_counts": chain_counts,
+        "h_len": h_len,
+        "t_len": len(t_keys),
+    }
 
 
 def convert_cif_to_clean_pdb(cif_path: Path, out_pdb: Path) -> Dict[str, int]:
@@ -252,6 +363,7 @@ def main() -> int:
     logdir = (root / args.logdir).resolve()
     job_map_csv = (root / args.job_map_csv).resolve()
     pipeline_cfg = read_yaml((root / args.pipeline_config).resolve())
+    cdr = load_cdr_boundaries((root / args.cdr_config).resolve())
 
     if not af3_dir.exists():
         raise PipelineError(f"AF3 results dir not found: {af3_dir}")
@@ -313,6 +425,7 @@ def main() -> int:
             per_model_dir = workdir / job_name / f"model_{midx}"
             per_model_dir.mkdir(parents=True, exist_ok=True)
             pdb_path = per_model_dir / f"{job_name}_model_{midx}.rfab_clean.pdb"
+            hlt_pdb_path = per_model_dir / f"{job_name}_model_{midx}.rfab_hlt_remarked.pdb"
             rf2_json = per_model_dir / f"{job_name}_model_{midx}_rf2.json"
             rf2_log = logdir / f"{job_name}_rf2.log"
 
@@ -324,6 +437,7 @@ def main() -> int:
                 "model_index": midx,
                 "af3_model_cif": str(cif_path),
                 "converted_pdb": str(pdb_path),
+                "rf2_input_pdb": str(hlt_pdb_path),
                 "rf2_json": str(rf2_json),
                 "rf2_best_pdb": "",
                 "rf2_pae": math.nan,
@@ -336,13 +450,18 @@ def main() -> int:
             }
             try:
                 convert_cif_to_clean_pdb(cif_path, pdb_path)
+                convert_clean_pdb_to_hlt_remarked(
+                    clean_pdb=pdb_path,
+                    out_hlt_pdb=hlt_pdb_path,
+                    cdr_ranges={"H1": cdr.h1, "H2": cdr.h2, "H3": cdr.h3},
+                )
                 if (not args.no_resume) and rf2_json.exists():
                     # Reuse prior RF2 result JSON
                     metrics = json.loads(rf2_json.read_text(encoding="utf-8"))
                 else:
                     metrics = run_rf2_filter(
                         cfg=tool_cfg,
-                        input_pdb=pdb_path,
+                        input_pdb=hlt_pdb_path,
                         sequence="",
                         out_json=rf2_json,
                         dry_run=(not tool_cfg.execute_real_tools),
