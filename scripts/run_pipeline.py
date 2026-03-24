@@ -41,6 +41,7 @@ from tool_wrappers import (
     run_proteinmpnn_sequence_design,
     run_rfdiffusion_backbone,
     run_rf2_filter,
+    thread_sequence_on_backbone_pose,
 )
 
 
@@ -53,6 +54,26 @@ class Combination:
     h3_delta: int
     h1_length: int
     h3_length: int
+
+
+@dataclass
+class RescueCondition:
+    condition_id: str
+    phase_condition_id: str
+    parent_candidate_id: str
+    parent_combination_id: str
+    parent_campaign_name: str
+    parent_h1_length: int
+    parent_h2_length: int
+    parent_h3_length: int
+    parent_full_sequence: str
+    parent_h1_sequence: str
+    parent_h2_sequence: str
+    parent_h3_sequence: str
+    parent_structure_pdb: str
+    hotspot_set_name: str
+    hotspot_residues: List[int]
+    hotspot_tokens: List[str]
 
 
 def parse_model(structure_path: Path):
@@ -148,6 +169,8 @@ def parse_args() -> argparse.Namespace:
             "phase2_focused_pilot",
             "phase3_main_campaign",
             "phase4_h2_refine",
+            "phase5_cdr1_rescue_pilot",
+            "phase6_cdr1_rescue_main",
             "all",
         ],
     )
@@ -159,6 +182,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cdr-config", default="data/configs/cdr_boundaries.yaml")
     parser.add_argument("--resolved-inputs", default="data/processed/resolved_inputs.yaml")
     parser.add_argument("--resolved-targets", default="data/processed/resolved_targets.yaml")
+    parser.add_argument("--cdr1-rescue-config", default="data/configs/cdr1_rescue_phase.yaml")
+    parser.add_argument("--cdr1-rescue-hotspots", default="data/configs/cdr1_rescue_hotspots.yaml")
     parser.add_argument(
         "--phase2-selection-config",
         default="data/configs/phase2_selected_combinations.yaml",
@@ -253,6 +278,13 @@ def load_base_context(args: argparse.Namespace) -> dict:
         if enabled and isinstance(ids, list):
             phase3_manual_selection_ids = [str(x).strip() for x in ids if str(x).strip()]
 
+    cdr1_rescue_cfg_path = root / args.cdr1_rescue_config
+    cdr1_rescue_hotspot_path = root / args.cdr1_rescue_hotspots
+    cdr1_rescue_cfg = read_yaml(cdr1_rescue_cfg_path) if cdr1_rescue_cfg_path.exists() else {}
+    cdr1_rescue_hotspots = (
+        read_yaml(cdr1_rescue_hotspot_path) if cdr1_rescue_hotspot_path.exists() else {}
+    )
+
     # Normalize known path-like fields to absolute paths for robust execution
     for key in (
         "vp1_sequence_file",
@@ -328,6 +360,10 @@ def load_base_context(args: argparse.Namespace) -> dict:
         "phase2_manual_selection_ids": phase2_manual_selection_ids,
         "phase3_selection_path": str(phase3_selection_path),
         "phase3_manual_selection_ids": phase3_manual_selection_ids,
+        "cdr1_rescue_cfg_path": str(cdr1_rescue_cfg_path),
+        "cdr1_rescue_hotspot_path": str(cdr1_rescue_hotspot_path),
+        "cdr1_rescue_cfg": cdr1_rescue_cfg,
+        "cdr1_rescue_hotspots": cdr1_rescue_hotspots,
     }
 
 
@@ -930,6 +966,1027 @@ def load_phase4_input_rows(context: dict, args: argparse.Namespace) -> Tuple[Lis
         )
 
     return merged_rows, phase4_input_path
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _parse_h1_h3_from_combo_id(combination_id: str) -> Tuple[Optional[int], Optional[int]]:
+    token = str(combination_id or "").strip()
+    if not token:
+        return None, None
+    m = re.search(r"_H1(\d+)_H3(\d+)$", token)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _normalize_candidate_row(root: Path, row: Dict[str, object]) -> Dict[str, object]:
+    merged = infer_candidate_structure_paths(root=root, row=dict(row))
+    for key in (
+        "rf2_best_pdb",
+        "designed_pdb",
+        "backbone_pdb",
+        "parent_backbone_pdb",
+    ):
+        val = cell_to_str(merged.get(key))
+        if val:
+            resolved = resolve_path_like(root, val)
+            if resolved is not None:
+                merged[key] = str(resolved)
+    return merged
+
+
+def _candidate_index_for_rescue(root: Path) -> Dict[str, Dict[str, object]]:
+    source_csvs = [
+        root / "results/summaries/final25_h2_optimized_candidates.csv",
+        root / "results/summaries/final25_h2_guardrailed.csv",
+        root / "results/summaries/final_25_h2_optimized_candidates_table.csv",
+        root / "results/rf2_passed/final25_rf2_passed_or_best.csv",
+    ]
+    index: Dict[str, Dict[str, object]] = {}
+    for cpath in source_csvs:
+        if not cpath.exists():
+            continue
+        try:
+            rows = pd.read_csv(cpath).to_dict(orient="records")
+        except Exception:
+            continue
+        for row in rows:
+            cid = cell_to_str(row.get("candidate_id"))
+            if not cid:
+                continue
+            if cid not in index:
+                index[cid] = _normalize_candidate_row(root=root, row=row)
+    return index
+
+
+def _normalize_parent_sequence(seq: str, source: str, candidate_id: str) -> str:
+    token = re.sub(r"\s+", "", str(seq or "").upper())
+    if not token:
+        return ""
+    invalid = sorted(set(ch for ch in token if ch not in "ACDEFGHIKLMNPQRSTVWY"))
+    if invalid:
+        raise PipelineError(
+            f"Invalid amino-acid character(s) in {source} for {candidate_id}: {''.join(invalid)}"
+        )
+    return token
+
+
+def _manual_parent_sequence_index(context: dict) -> Dict[str, str]:
+    rescue_cfg = context.get("cdr1_rescue_cfg", {}) or {}
+    phase5_cfg = rescue_cfg.get("phase5", {}) if isinstance(rescue_cfg, dict) else {}
+    raw = phase5_cfg.get("parent_full_sequences", {})
+    out: Dict[str, str] = {}
+
+    if isinstance(raw, dict):
+        items = raw.items()
+        for cid, seq in items:
+            key = cell_to_str(cid)
+            if not key:
+                continue
+            normalized = _normalize_parent_sequence(seq, "phase5.parent_full_sequences", key)
+            if normalized:
+                out[key] = normalized
+        return out
+
+    if isinstance(raw, list):
+        for row in raw:
+            if not isinstance(row, dict):
+                continue
+            cid = cell_to_str(row.get("candidate_id"))
+            if not cid:
+                continue
+            normalized = _normalize_parent_sequence(row.get("full_sequence", ""), "phase5.parent_full_sequences", cid)
+            if normalized:
+                out[cid] = normalized
+    return out
+
+
+def resolve_cdr1_rescue_parents(context: dict, parent_candidate_ids: Sequence[str]) -> List[dict]:
+    root = context["root"]
+    framework_parts = split_framework_and_cdr(context["nanobody_seq"], context["cdr"])
+    index = _candidate_index_for_rescue(root)
+    manual_seq_index = _manual_parent_sequence_index(context)
+    fasta_seq_index: Dict[str, str] = {}
+    af3_fasta = root / "af3_final25_nanobody.fasta"
+    if af3_fasta.exists():
+        try:
+            for header, seq in read_sequence_file(af3_fasta):
+                key = cell_to_str(header).split()[0]
+                if key and seq:
+                    fasta_seq_index[key] = _normalize_parent_sequence(seq, "af3_final25_nanobody.fasta", key)
+        except Exception:
+            fasta_seq_index = {}
+
+    resolved: List[dict] = []
+    for cid in parent_candidate_ids:
+        if cid in index:
+            row = dict(index[cid])
+        else:
+            # Robust fallback: if exact H2 variant is absent in final tables, use same backbone/stem variant
+            # for structure path, while keeping the requested exact candidate ID and sequence (from FASTA).
+            stem = cid.split("__H2v")[0] if "__H2v" in cid else cid
+            candidates = [k for k in index.keys() if k.startswith(stem + "__H2v")]
+            if not candidates:
+                raise PipelineError(
+                    "CDR1 rescue parent candidate not found in known result tables and no same-stem fallback exists: "
+                    f"{cid}. Checked final25_h2_optimized_candidates.csv/final25_h2_guardrailed.csv."
+                )
+            row = dict(index[sorted(candidates)[0]])
+
+        source_full_seq = _normalize_parent_sequence(
+            cell_to_str(row.get("full_sequence")),
+            "existing summary tables",
+            cid,
+        )
+        exact_manual_seq = manual_seq_index.get(cid, "")
+        exact_fasta_seq = fasta_seq_index.get(cid, "")
+        full_seq = exact_manual_seq or exact_fasta_seq or source_full_seq
+        if not full_seq:
+            raise PipelineError(
+                f"Parent candidate {cid} has empty full_sequence and no sequence in either "
+                "phase5.parent_full_sequences or af3_final25_nanobody.fasta."
+            )
+
+        h1_len = parse_int_maybe(row.get("h1_length"), context["cdr"].h1_len)
+        h3_len = parse_int_maybe(row.get("h3_length"), context["cdr"].h3_len)
+        combo_id = cell_to_str(row.get("combination_id"))
+        combo_h1, combo_h3 = _parse_h1_h3_from_combo_id(combo_id)
+        if combo_h1 is not None:
+            h1_len = combo_h1
+        if combo_h3 is not None:
+            h3_len = combo_h3
+
+        h1_seq = cell_to_str(row.get("h1_sequence"))
+        h2_seq = cell_to_str(row.get("h2_sequence"))
+        h3_seq = cell_to_str(row.get("h3_sequence"))
+        if not (h1_seq and h2_seq and h3_seq):
+            try:
+                h1_guess, h2_guess, h3_guess = split_designed_sequence(
+                    parts=framework_parts,
+                    full_seq=full_seq,
+                    h1_len=h1_len,
+                    h3_len=h3_len,
+                )
+                if not h1_seq:
+                    h1_seq = h1_guess
+                if not h2_seq:
+                    h2_seq = h2_guess
+                if not h3_seq:
+                    h3_seq = h3_guess
+            except Exception as exc:
+                raise PipelineError(
+                    f"Failed to recover H1/H2/H3 sequences for parent {cid}: {exc}"
+                ) from exc
+
+        parent_structure = (
+            cell_to_str(row.get("rf2_best_pdb"))
+            or cell_to_str(row.get("designed_pdb"))
+            or cell_to_str(row.get("backbone_pdb"))
+            or cell_to_str(row.get("parent_backbone_pdb"))
+        )
+        if not parent_structure:
+            raise PipelineError(
+                f"Parent candidate {cid} has no resolvable structure path (rf2_best_pdb/designed_pdb/backbone_pdb)."
+            )
+
+        resolved.append(
+            {
+                "candidate_id": cid,
+                "combination_id": combo_id,
+                "campaign_name": cell_to_str(row.get("campaign_name")),
+                "h1_length": int(h1_len),
+                "h2_length": len(h2_seq),
+                "h3_length": int(h3_len),
+                "h1_sequence": h1_seq,
+                "h2_sequence": h2_seq,
+                "h3_sequence": h3_seq,
+                "full_sequence": full_seq,
+                "structure_pdb": parent_structure,
+            }
+        )
+    return resolved
+
+
+def build_cdr1_rescue_hotspot_sets(
+    hotspot_cfg: dict,
+    antigen_chain_ids: Sequence[str],
+    selected_set_names: Optional[Sequence[str]] = None,
+) -> Dict[str, Dict[str, object]]:
+    sets = hotspot_cfg.get("cdr1_rescue_hotspot_sets", {})
+    if not sets:
+        raise PipelineError("Missing cdr1_rescue_hotspot_sets in data/configs/cdr1_rescue_hotspots.yaml")
+
+    if selected_set_names:
+        names = [n for n in selected_set_names if n]
+    else:
+        names = list(sets.keys())
+
+    out: Dict[str, Dict[str, object]] = {}
+    for set_name in names:
+        if set_name not in sets:
+            raise PipelineError(f"Unknown CDR1 rescue hotspot set: {set_name}")
+        residues = [int(x) for x in sets[set_name].get("residues", [])]
+        if not residues:
+            raise PipelineError(f"Hotspot set {set_name} has empty residues list.")
+        tokens: List[str] = []
+        for chain_id in antigen_chain_ids:
+            for resnum in residues:
+                tokens.append(f"{chain_id}{resnum}")
+        out[set_name] = {
+            "residues": residues,
+            "tokens": tokens,
+            "description": cell_to_str(sets[set_name].get("description")),
+        }
+    return out
+
+
+def enforce_cdr1_editable_positions(
+    parent_full_seq: str,
+    proposed_full_seq: str,
+    editable_positions: Sequence[int],
+) -> Tuple[str, List[int], str]:
+    parent = str(parent_full_seq).strip().upper()
+    proposed = str(proposed_full_seq).strip().upper()
+    if not parent:
+        return proposed, [], "Parent sequence missing; rescue mask not applied."
+    if len(proposed) != len(parent):
+        return parent, [], (
+            f"Proposed sequence length mismatch (got {len(proposed)}, expected {len(parent)}); "
+            "fallback to parent sequence."
+        )
+
+    out = list(parent)
+    edited_positions: List[int] = []
+    for p in editable_positions:
+        idx = int(p) - 1
+        if idx < 0 or idx >= len(out):
+            continue
+        aa = proposed[idx]
+        if aa not in "ACDEFGHIKLMNPQRSTVWY":
+            continue
+        out[idx] = aa
+        if aa != parent[idx]:
+            edited_positions.append(int(p))
+    return "".join(out), edited_positions, ""
+
+
+def rescue_strict_relaxed_flags(
+    rf2_pae: float,
+    rf2_rmsd: float,
+    strict_cfg: dict,
+    relaxed_cfg: dict,
+) -> Tuple[int, int]:
+    strict = int(
+        (rf2_pae < float(strict_cfg.get("rf2_pae_max", 10.0)))
+        and (rf2_rmsd < float(strict_cfg.get("design_rf2_rmsd_max", 2.0)))
+    )
+    relaxed = int(
+        (rf2_pae < float(relaxed_cfg.get("rf2_pae_max", 12.0)))
+        and (rf2_rmsd < float(relaxed_cfg.get("design_rf2_rmsd_max", 2.5)))
+    )
+    return strict, relaxed
+
+
+def rank_phase5_rescue_conditions(condition_rows: List[dict], top_k: int) -> Tuple[List[dict], List[dict]]:
+    if not condition_rows:
+        return [], []
+    ranked = sorted(
+        condition_rows,
+        key=lambda x: (
+            int(x.get("strict_pass_count", 0)),
+            int(x.get("relaxed_pass_count", 0)),
+            float(x.get("mean_ranking_score", 0.0)),
+            -float(x.get("mean_design_rf2_rmsd", 999.0)),
+            -float(x.get("mean_rf2_pae", 999.0)),
+        ),
+        reverse=True,
+    )
+    out: List[dict] = []
+    for idx, row in enumerate(ranked, start=1):
+        r = dict(row)
+        r["rank"] = idx
+        r["selected_for_phase6"] = int(idx <= max(1, top_k))
+        out.append(r)
+    selected = [r for r in out if int(r.get("selected_for_phase6", 0)) == 1]
+    return out, selected
+
+
+def export_af3_handoff_custom(context: dict, final_rows: List[dict], outdir: Path):
+    root = context["root"]
+    resolved_inputs = context["resolved_inputs"]
+    resolved_targets = context["resolved_targets"]
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    vp1_seq = read_sequence_file(Path(resolved_inputs["vp1_sequence_file"]))[0][1]
+    pdom_seq = read_sequence_file(Path(resolved_inputs["p_domain_dimer_sequence_file"]))[0][1]
+
+    submission_csv = outdir / "af3_web_submission_table.csv"
+    rows = []
+    for r in final_rows:
+        rows.append(
+            {
+                "candidate_id": r.get("candidate_id", ""),
+                "parent_candidate_id": r.get("parent_candidate_id", ""),
+                "condition_id": r.get("condition_id", ""),
+                "hotspot_set_name": r.get("hotspot_set_name", ""),
+                "h1_sequence": r.get("h1_sequence", ""),
+                "h2_sequence": r.get("h2_sequence", ""),
+                "h3_sequence": r.get("h3_sequence", ""),
+                "full_nanobody_sequence": r.get("full_sequence", ""),
+                "rf2_pae": r.get("rf2_pae", ""),
+                "design_rf2_rmsd": r.get("design_rf2_rmsd", ""),
+                "strict_pass": r.get("strict_pass", ""),
+                "relaxed_pass": r.get("relaxed_pass", ""),
+                "ranking_score": r.get("ranking_score", ""),
+                "rf2_best_pdb": r.get("rf2_best_pdb", ""),
+                "notes": r.get("warning", ""),
+            }
+        )
+    atomic_write_csv(
+        submission_csv,
+        rows,
+        [
+            "candidate_id",
+            "parent_candidate_id",
+            "condition_id",
+            "hotspot_set_name",
+            "h1_sequence",
+            "h2_sequence",
+            "h3_sequence",
+            "full_nanobody_sequence",
+            "rf2_pae",
+            "design_rf2_rmsd",
+            "strict_pass",
+            "relaxed_pass",
+            "ranking_score",
+            "rf2_best_pdb",
+            "notes",
+        ],
+    )
+
+    fasta_out = outdir / "af3_final25_nanobody.fasta"
+    with fasta_out.open("w", encoding="utf-8") as handle:
+        for r in final_rows:
+            handle.write(f">{r['candidate_id']}\n{r['full_sequence']}\n")
+
+    context_txt = outdir / "af3_antigen_context.txt"
+    context_txt.write_text(
+        "\n".join(
+            [
+                "AF3 manual submission context (CDR1 rescue)",
+                "==========================================",
+                f"Full cleaned antigen target: {resolved_targets.get('full_cleaned_target', '')}",
+                f"Cropped design target: {resolved_targets.get('cropped_design_target', '')}",
+                f"Residue mapping table: {resolved_targets.get('mapping_table', '')}",
+                f"VP1 sequence length: {len(vp1_seq)}",
+                f"P-domain sequence length: {len(pdom_seq)}",
+                "",
+                "No local AF3 run was performed by this pipeline.",
+                "Submit final candidates manually via AF3 web.",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary_md = outdir / "af3_handoff_summary.md"
+    summary_md.write_text(
+        "\n".join(
+            [
+                SAFETY_ETHICS_STATEMENT,
+                "",
+                "# AF3 Web Handoff (CDR1 Rescue)",
+                "",
+                f"- Submission table: `{submission_csv}`",
+                f"- FASTA: `{fasta_out}`",
+                f"- Antigen context: `{context_txt}`",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def run_cdr1_rescue_design(
+    phase_name: str,
+    conditions: List[RescueCondition],
+    context: dict,
+    args: argparse.Namespace,
+    backbones_target: int,
+    seqs_per_backbone: int,
+    editable_positions: Sequence[int],
+    strict_cfg: dict,
+    relaxed_cfg: dict,
+) -> List[dict]:
+    root = context["root"]
+    pipeline_cfg = context["pipeline_cfg"]
+    tooling = context["tool_cfg"]
+    rank_weights = pipeline_cfg.get("filters", {}).get("ranking_weights", {})
+    seed_base = int(pipeline_cfg.get("project", {}).get("random_seed", 20260316))
+    framework_parts = split_framework_and_cdr(context["nanobody_seq"], context["cdr"])
+
+    phase_dir = root / phase_name
+    cond_dir = phase_dir / "conditions"
+    logs_dir = root / "logs" / phase_name
+    ensure_dirs([phase_dir, cond_dir, logs_dir])
+
+    if args.limit_per_combination is not None:
+        backbones_target = min(backbones_target, int(args.limit_per_combination))
+    if args.max_combinations is not None:
+        conditions = conditions[: int(args.max_combinations)]
+
+    status_path = phase_dir / "phase_status.json"
+    manifest_path = phase_dir / "phase_manifest.csv"
+    status = read_status(status_path)
+    completed = set(status.get("completed_conditions", [])) if args.resume else set()
+    manifest_rows: List[dict] = []
+    condition_summaries: List[dict] = []
+
+    target_pdb = Path(context["resolved_targets"]["cropped_design_target"])
+    if not target_pdb.exists():
+        raise PipelineError(f"Missing cropped design target for rescue phase: {target_pdb}")
+    target_contig = str(context["rfdiffusion_target_contig"])
+
+    for cond in conditions:
+        parent_structure = Path(cond.parent_structure_pdb)
+        if not args.dry_run:
+            if not str(cond.parent_structure_pdb).strip():
+                raise PipelineError(
+                    f"{phase_name} missing parent structure path for condition {cond.condition_id}"
+                )
+            if not parent_structure.exists():
+                raise PipelineError(
+                    f"{phase_name} parent structure not found for {cond.condition_id}: {parent_structure}"
+                )
+
+        cdir = cond_dir / cond.phase_condition_id
+        ensure_dirs([cdir, cdir / "backbones", cdir / "rf2_metrics", cdir / "mpnn_aux"])
+        if args.resume and cond.phase_condition_id in completed:
+            summary_path = cdir / "condition_summary.json"
+            if summary_path.exists():
+                condition_summaries.append(read_json(summary_path))
+                manifest_rows.append(
+                    {
+                        "condition_id": cond.condition_id,
+                        "phase_condition_id": cond.phase_condition_id,
+                        "status": "skipped_resume",
+                        "updated_at": now_str(),
+                    }
+                )
+                continue
+
+        backbones_csv = cdir / "backbones.csv"
+        candidates_csv = cdir / "candidates.csv"
+        backbones = load_or_empty_csv(backbones_csv)
+        existing_backbone_ids = {cell_to_str(x.get("backbone_id")) for x in backbones}
+
+        for i in range(1, backbones_target + 1):
+            bb_id = f"{cond.phase_condition_id}_bb{i:03d}"
+            if bb_id in existing_backbone_ids:
+                continue
+            bb_pdb = cdir / "backbones" / f"{bb_id}.pdb"
+            run_rfdiffusion_backbone(
+                cfg=tooling,
+                combo={
+                    "campaign_name": f"cdr1_rescue::{cond.hotspot_set_name}",
+                    "h1_length": cond.parent_h1_length,
+                    "h2_length": cond.parent_h2_length,
+                    "h3_length": cond.parent_h3_length,
+                },
+                backbone_id=bb_id,
+                target_pdb=target_pdb,
+                framework_pdb=parent_structure,
+                hotspots=cond.hotspot_tokens,
+                target_contig=target_contig,
+                binder_length=len(cond.parent_full_sequence),
+                out_pdb=bb_pdb,
+                seed=seed_base,
+                log_file=logs_dir / f"{cond.phase_condition_id}_rfdiffusion.log",
+                dry_run=args.dry_run,
+                design_loops=f"H1:{cond.parent_h1_length}",
+            )
+            backbones.append(
+                {
+                    "condition_id": cond.condition_id,
+                    "phase_condition_id": cond.phase_condition_id,
+                    "parent_candidate_id": cond.parent_candidate_id,
+                    "hotspot_set_name": cond.hotspot_set_name,
+                    "backbone_id": bb_id,
+                    "backbone_pdb": str(bb_pdb),
+                    "backbone_signature": compute_backbone_signature(bb_pdb),
+                }
+            )
+            existing_backbone_ids.add(bb_id)
+
+        write_rows(
+            backbones_csv,
+            backbones,
+            [
+                "condition_id",
+                "phase_condition_id",
+                "parent_candidate_id",
+                "hotspot_set_name",
+                "backbone_id",
+                "backbone_pdb",
+                "backbone_signature",
+            ],
+        )
+
+        candidates = load_or_empty_csv(candidates_csv)
+        existing_candidate_ids = {cell_to_str(x.get("candidate_id")) for x in candidates}
+
+        for bb in backbones:
+            bb_id = cell_to_str(bb.get("backbone_id"))
+            bb_pdb = Path(cell_to_str(bb.get("backbone_pdb")))
+            expected = {f"{bb_id}_s{s:02d}" for s in range(1, seqs_per_backbone + 1)}
+            if expected.issubset(existing_candidate_ids):
+                continue
+
+            mpnn_records = run_proteinmpnn_sequence_design(
+                cfg=tooling,
+                backbone_pdb=bb_pdb,
+                out_dir=(cdir / "mpnn_aux" / bb_id),
+                seed=seed_base,
+                dry_run=args.dry_run,
+                log_file=logs_dir / f"{cond.phase_condition_id}_mpnn.log",
+                loops="H1",
+                seqs_per_struct=seqs_per_backbone,
+                temperature=0.1,
+            )
+            if not mpnn_records:
+                raise PipelineError(f"ProteinMPNN produced no records for rescue backbone {bb_id}")
+
+            for sidx in range(1, seqs_per_backbone + 1):
+                cid = f"{bb_id}_s{sidx:02d}"
+                if cid in existing_candidate_ids:
+                    continue
+                record = mpnn_records[min(sidx - 1, len(mpnn_records) - 1)]
+                proposed_seq = cell_to_str(record.get("full_sequence"))
+                constrained_seq, edited_pos, mask_warning = enforce_cdr1_editable_positions(
+                    parent_full_seq=cond.parent_full_sequence,
+                    proposed_full_seq=proposed_seq,
+                    editable_positions=editable_positions,
+                )
+
+                threaded_pdb = cdir / "mpnn_aux" / bb_id / f"{cid}_threaded.pdb"
+                if args.dry_run or not tooling.execute_real_tools:
+                    threaded_pdb = bb_pdb
+                else:
+                    thread_sequence_on_backbone_pose(
+                        backbone_pdb=bb_pdb,
+                        binder_sequence=constrained_seq,
+                        out_pdb=threaded_pdb,
+                        binder_chain=context["cdr"].chain_id or "H",
+                    )
+
+                rf2_json = cdir / "rf2_metrics" / f"{cid}_rf2.json"
+                metrics = run_rf2_filter(
+                    cfg=tooling,
+                    input_pdb=threaded_pdb,
+                    sequence=constrained_seq,
+                    out_json=rf2_json,
+                    dry_run=args.dry_run,
+                    log_file=logs_dir / f"{cond.phase_condition_id}_rf2.log",
+                    seed=seed_base,
+                    context={
+                        "candidate_id": cid,
+                        "campaign_name": cond.parent_campaign_name,
+                        "cdr3_contact_bias": 1,
+                    },
+                )
+
+                heuristics = compute_interface_heuristics(
+                    pdb_path=Path(str(metrics.get("rf2_best_pdb", threaded_pdb))),
+                    parts=framework_parts,
+                    h1_len=cond.parent_h1_length,
+                    h3_len=cond.parent_h3_length,
+                    hotspot_tokens=cond.hotspot_tokens,
+                    cutoff=5.0,
+                )
+                metrics.update(heuristics)
+                if "structural_plausibility" not in metrics:
+                    metrics["structural_plausibility"] = max(0.0, min(1.0, float(metrics.get("rf2_pred_lddt", 0.0))))
+
+                score = combine_weighted_score(metrics, rank_weights)
+                strict_pass, relaxed_pass = rescue_strict_relaxed_flags(
+                    rf2_pae=_safe_float(metrics.get("rf2_pae"), 99.0),
+                    rf2_rmsd=_safe_float(metrics.get("design_rf2_rmsd"), 99.0),
+                    strict_cfg=strict_cfg,
+                    relaxed_cfg=relaxed_cfg,
+                )
+                warning = mask_warning
+                if edited_pos:
+                    extra = f"CDR1 editable positions changed: {','.join(str(x) for x in edited_pos)}"
+                    warning = f"{warning} | {extra}" if warning else extra
+
+                try:
+                    h1_seq_c, h2_seq_c, h3_seq_c = split_designed_sequence(
+                        parts=framework_parts,
+                        full_seq=constrained_seq,
+                        h1_len=cond.parent_h1_length,
+                        h3_len=cond.parent_h3_length,
+                    )
+                except Exception:
+                    h1_seq_c = cond.parent_h1_sequence
+                    h2_seq_c = cond.parent_h2_sequence
+                    h3_seq_c = cond.parent_h3_sequence
+
+                candidates.append(
+                    {
+                        "phase": phase_name,
+                        "condition_id": cond.condition_id,
+                        "phase_condition_id": cond.phase_condition_id,
+                        "parent_candidate_id": cond.parent_candidate_id,
+                        "parent_combination_id": cond.parent_combination_id,
+                        "parent_campaign_name": cond.parent_campaign_name,
+                        "hotspot_set_name": cond.hotspot_set_name,
+                        "hotspot_residues": ",".join(str(x) for x in cond.hotspot_residues),
+                        "editable_cdr1_positions": ",".join(str(x) for x in editable_positions),
+                        "backbone_id": bb_id,
+                        "backbone_pdb": str(bb_pdb),
+                        "backbone_signature": cell_to_str(bb.get("backbone_signature")),
+                        "candidate_id": cid,
+                        "threaded_pdb": str(threaded_pdb),
+                        "rf2_best_pdb": str(metrics.get("rf2_best_pdb", "")),
+                        "h1_sequence": h1_seq_c,
+                        "h2_sequence": h2_seq_c,
+                        "h3_sequence": h3_seq_c,
+                        "full_sequence": constrained_seq,
+                        "strict_pass": strict_pass,
+                        "relaxed_pass": relaxed_pass,
+                        "hard_filter_pass": strict_pass,
+                        "rf2_pae": metrics.get("rf2_pae", ""),
+                        "design_rf2_rmsd": metrics.get("design_rf2_rmsd", ""),
+                        "hotspot_agreement": metrics.get("hotspot_agreement", ""),
+                        "groove_localization": metrics.get("groove_localization", ""),
+                        "h1_h3_role_consistency": metrics.get("h1_h3_role_consistency", ""),
+                        "structural_plausibility": metrics.get("structural_plausibility", ""),
+                        "target_contact_residue_count": metrics.get("target_contact_residue_count", ""),
+                        "hotspot_overlap_count": metrics.get("hotspot_overlap_count", ""),
+                        "ranking_score": round(float(score), 6),
+                        "cdr1_edit_count": len(edited_pos),
+                        "cdr1_edited_positions": ",".join(str(x) for x in edited_pos),
+                        "cdr1_rescue_stable_interacting_positions_count": "",
+                        "cdr1_rescue_wt_anchor_overlap_count": "",
+                        "cdr1_rescue_hotspot_enrichment_score": "",
+                        "warning": warning,
+                    }
+                )
+                existing_candidate_ids.add(cid)
+
+        candidate_fields = [
+            "phase",
+            "condition_id",
+            "phase_condition_id",
+            "parent_candidate_id",
+            "parent_combination_id",
+            "parent_campaign_name",
+            "hotspot_set_name",
+            "hotspot_residues",
+            "editable_cdr1_positions",
+            "backbone_id",
+            "backbone_pdb",
+            "backbone_signature",
+            "candidate_id",
+            "threaded_pdb",
+            "rf2_best_pdb",
+            "h1_sequence",
+            "h2_sequence",
+            "h3_sequence",
+            "full_sequence",
+            "strict_pass",
+            "relaxed_pass",
+            "hard_filter_pass",
+            "rf2_pae",
+            "design_rf2_rmsd",
+            "hotspot_agreement",
+            "groove_localization",
+            "h1_h3_role_consistency",
+            "structural_plausibility",
+            "target_contact_residue_count",
+            "hotspot_overlap_count",
+            "ranking_score",
+            "cdr1_edit_count",
+            "cdr1_edited_positions",
+            "cdr1_rescue_stable_interacting_positions_count",
+            "cdr1_rescue_wt_anchor_overlap_count",
+            "cdr1_rescue_hotspot_enrichment_score",
+            "warning",
+        ]
+        write_rows(candidates_csv, candidates, candidate_fields)
+
+        df = pd.DataFrame(candidates)
+        if df.empty:
+            summary = {
+                "phase": phase_name,
+                "condition_id": cond.condition_id,
+                "phase_condition_id": cond.phase_condition_id,
+                "parent_candidate_id": cond.parent_candidate_id,
+                "hotspot_set_name": cond.hotspot_set_name,
+                "editable_cdr1_positions": ",".join(str(x) for x in editable_positions),
+                "total_designs": 0,
+                "strict_pass_count": 0,
+                "relaxed_pass_count": 0,
+                "strict_pass_rate": 0.0,
+                "relaxed_pass_rate": 0.0,
+                "mean_ranking_score": 0.0,
+                "mean_rf2_pae": 0.0,
+                "mean_design_rf2_rmsd": 0.0,
+                "unique_sequence_count": 0,
+                "unique_backbone_count": 0,
+                "cdr1_rescue_stable_interacting_positions_count": "",
+                "cdr1_rescue_wt_anchor_overlap_count": "",
+                "cdr1_rescue_hotspot_enrichment_score": "",
+            }
+        else:
+            total = int(df.shape[0])
+            strict_count = int(df["strict_pass"].astype(int).sum())
+            relaxed_count = int(df["relaxed_pass"].astype(int).sum())
+            summary = {
+                "phase": phase_name,
+                "condition_id": cond.condition_id,
+                "phase_condition_id": cond.phase_condition_id,
+                "parent_candidate_id": cond.parent_candidate_id,
+                "hotspot_set_name": cond.hotspot_set_name,
+                "editable_cdr1_positions": ",".join(str(x) for x in editable_positions),
+                "total_designs": total,
+                "strict_pass_count": strict_count,
+                "relaxed_pass_count": relaxed_count,
+                "strict_pass_rate": round(strict_count / max(1, total), 4),
+                "relaxed_pass_rate": round(relaxed_count / max(1, total), 4),
+                "mean_ranking_score": float(df["ranking_score"].astype(float).mean()),
+                "mean_rf2_pae": float(df["rf2_pae"].astype(float).mean()),
+                "mean_design_rf2_rmsd": float(df["design_rf2_rmsd"].astype(float).mean()),
+                "unique_sequence_count": int(df["full_sequence"].nunique()),
+                "unique_backbone_count": int(df["backbone_id"].nunique()),
+                "cdr1_rescue_stable_interacting_positions_count": "",
+                "cdr1_rescue_wt_anchor_overlap_count": "",
+                "cdr1_rescue_hotspot_enrichment_score": "",
+            }
+
+        write_json(cdir / "condition_summary.json", summary)
+        condition_summaries.append(summary)
+        manifest_rows.append(
+            {
+                "condition_id": cond.condition_id,
+                "phase_condition_id": cond.phase_condition_id,
+                "parent_candidate_id": cond.parent_candidate_id,
+                "hotspot_set_name": cond.hotspot_set_name,
+                "status": "completed",
+                "updated_at": now_str(),
+            }
+        )
+        completed.add(cond.phase_condition_id)
+        write_status(
+            status_path,
+            {
+                "phase": phase_name,
+                "updated_at": now_str(),
+                "completed_conditions": sorted(completed),
+            },
+        )
+
+    atomic_write_csv(
+        manifest_path,
+        manifest_rows,
+        ["condition_id", "phase_condition_id", "parent_candidate_id", "hotspot_set_name", "status", "updated_at"],
+    )
+    return condition_summaries
+
+
+def run_phase5_cdr1_rescue_pilot(context: dict, args: argparse.Namespace):
+    root = context["root"]
+    phase_cfg = context["phases_cfg"]["phases"]["phase5_cdr1_rescue_pilot"]
+    rescue_cfg = context.get("cdr1_rescue_cfg", {})
+    hotspot_cfg = context.get("cdr1_rescue_hotspots", {})
+    if not rescue_cfg:
+        raise PipelineError(
+            "Missing CDR1 rescue phase config. Expected: data/configs/cdr1_rescue_phase.yaml"
+        )
+    if not hotspot_cfg:
+        raise PipelineError(
+            "Missing CDR1 rescue hotspot config. Expected: data/configs/cdr1_rescue_hotspots.yaml"
+        )
+
+    phase5_cfg = rescue_cfg.get("phase5", {})
+    parent_ids = [cell_to_str(x) for x in phase5_cfg.get("parent_candidate_ids", []) if cell_to_str(x)]
+    if not parent_ids:
+        raise PipelineError("phase5.parent_candidate_ids is empty in cdr1 rescue config.")
+    parents = resolve_cdr1_rescue_parents(context=context, parent_candidate_ids=parent_ids)
+
+    editable_positions = [int(x) for x in rescue_cfg.get("cdr1_rescue", {}).get("editable_positions", [26, 27, 28, 30, 31, 32])]
+    strict_cfg = rescue_cfg.get("cdr1_rescue", {}).get("strict_thresholds", {"rf2_pae_max": 10.0, "design_rf2_rmsd_max": 2.0})
+    relaxed_cfg = rescue_cfg.get("cdr1_rescue", {}).get("relaxed_thresholds", {"rf2_pae_max": 12.0, "design_rf2_rmsd_max": 2.5})
+
+    hotspot_names = [cell_to_str(x) for x in phase5_cfg.get("hotspot_set_names", []) if cell_to_str(x)]
+    hotspot_sets = build_cdr1_rescue_hotspot_sets(
+        hotspot_cfg=hotspot_cfg,
+        antigen_chain_ids=context["pipeline_cfg"].get("target_prep", {}).get("antigen_chain_ids", ["A", "B"]),
+        selected_set_names=hotspot_names,
+    )
+
+    conditions: List[RescueCondition] = []
+    for p in parents:
+        for hs_name, hs in hotspot_sets.items():
+            cond_id = f"{p['candidate_id']}__{hs_name}"
+            conditions.append(
+                RescueCondition(
+                    condition_id=cond_id,
+                    phase_condition_id=slugify(cond_id),
+                    parent_candidate_id=p["candidate_id"],
+                    parent_combination_id=p["combination_id"],
+                    parent_campaign_name=p["campaign_name"],
+                    parent_h1_length=int(p["h1_length"]),
+                    parent_h2_length=int(p["h2_length"]),
+                    parent_h3_length=int(p["h3_length"]),
+                    parent_full_sequence=p["full_sequence"],
+                    parent_h1_sequence=p["h1_sequence"],
+                    parent_h2_sequence=p["h2_sequence"],
+                    parent_h3_sequence=p["h3_sequence"],
+                    parent_structure_pdb=p["structure_pdb"],
+                    hotspot_set_name=hs_name,
+                    hotspot_residues=list(hs["residues"]),
+                    hotspot_tokens=list(hs["tokens"]),
+                )
+            )
+
+    summaries = run_cdr1_rescue_design(
+        phase_name="phase5_cdr1_rescue_pilot",
+        conditions=conditions,
+        context=context,
+        args=args,
+        backbones_target=int(phase_cfg.get("backbones_per_combination", phase5_cfg.get("backbones_per_condition", 50))),
+        seqs_per_backbone=int(phase_cfg.get("sequences_per_backbone", phase5_cfg.get("sequences_per_backbone", 1))),
+        editable_positions=editable_positions,
+        strict_cfg=strict_cfg,
+        relaxed_cfg=relaxed_cfg,
+    )
+
+    top_k = int(rescue_cfg.get("phase6", {}).get("top_conditions", 1))
+    ranked, selected = rank_phase5_rescue_conditions(summaries, top_k=top_k)
+
+    out_summary = root / "results/summaries/phase5_cdr1_rescue_pilot_summary.csv"
+    out_rank = root / "results/summaries/phase5_cdr1_rescue_condition_ranking.csv"
+    out_sel = root / "results/summaries/phase5_selected_conditions.csv"
+    if ranked:
+        fields = list(ranked[0].keys())
+        atomic_write_csv(out_summary, summaries, [k for k in fields if k not in {"rank", "selected_for_phase6"}])
+        atomic_write_csv(out_rank, ranked, fields)
+        atomic_write_csv(out_sel, selected, fields)
+    else:
+        atomic_write_csv(out_summary, [], [])
+        atomic_write_csv(out_rank, [], [])
+        atomic_write_csv(out_sel, [], [])
+
+
+def run_phase6_cdr1_rescue_main(context: dict, args: argparse.Namespace):
+    root = context["root"]
+    phase_cfg = context["phases_cfg"]["phases"]["phase6_cdr1_rescue_main"]
+    rescue_cfg = context.get("cdr1_rescue_cfg", {})
+    hotspot_cfg = context.get("cdr1_rescue_hotspots", {})
+    if not rescue_cfg or not hotspot_cfg:
+        raise PipelineError("Missing cdr1 rescue config/hotspot definitions for phase6.")
+
+    editable_positions = [int(x) for x in rescue_cfg.get("cdr1_rescue", {}).get("editable_positions", [26, 27, 28, 30, 31, 32])]
+    strict_cfg = rescue_cfg.get("cdr1_rescue", {}).get("strict_thresholds", {"rf2_pae_max": 10.0, "design_rf2_rmsd_max": 2.0})
+    relaxed_cfg = rescue_cfg.get("cdr1_rescue", {}).get("relaxed_thresholds", {"rf2_pae_max": 12.0, "design_rf2_rmsd_max": 2.5})
+    phase6_cfg = rescue_cfg.get("phase6", {})
+    phase5_cfg = rescue_cfg.get("phase5", {})
+
+    parent_ids = [cell_to_str(x) for x in phase5_cfg.get("parent_candidate_ids", []) if cell_to_str(x)]
+    parents = resolve_cdr1_rescue_parents(context=context, parent_candidate_ids=parent_ids)
+    hotspot_names = [cell_to_str(x) for x in phase5_cfg.get("hotspot_set_names", []) if cell_to_str(x)]
+    hotspot_sets = build_cdr1_rescue_hotspot_sets(
+        hotspot_cfg=hotspot_cfg,
+        antigen_chain_ids=context["pipeline_cfg"].get("target_prep", {}).get("antigen_chain_ids", ["A", "B"]),
+        selected_set_names=hotspot_names,
+    )
+
+    all_cond_map: Dict[str, RescueCondition] = {}
+    for p in parents:
+        for hs_name, hs in hotspot_sets.items():
+            cond_id = f"{p['candidate_id']}__{hs_name}"
+            phase_cond_id = slugify(cond_id)
+            all_cond_map[cond_id] = RescueCondition(
+                condition_id=cond_id,
+                phase_condition_id=phase_cond_id,
+                parent_candidate_id=p["candidate_id"],
+                parent_combination_id=p["combination_id"],
+                parent_campaign_name=p["campaign_name"],
+                parent_h1_length=int(p["h1_length"]),
+                parent_h2_length=int(p["h2_length"]),
+                parent_h3_length=int(p["h3_length"]),
+                parent_full_sequence=p["full_sequence"],
+                parent_h1_sequence=p["h1_sequence"],
+                parent_h2_sequence=p["h2_sequence"],
+                parent_h3_sequence=p["h3_sequence"],
+                parent_structure_pdb=p["structure_pdb"],
+                hotspot_set_name=hs_name,
+                hotspot_residues=list(hs["residues"]),
+                hotspot_tokens=list(hs["tokens"]),
+            )
+
+    manual_conditions = [cell_to_str(x) for x in phase6_cfg.get("manual_selected_conditions", []) if cell_to_str(x)]
+    selected_condition_ids: List[str] = []
+    if manual_conditions:
+        selected_condition_ids = manual_conditions
+    else:
+        sel_csv = root / "results/summaries/phase5_selected_conditions.csv"
+        require_file(sel_csv, "Run phase5_cdr1_rescue_pilot first, or set phase6.manual_selected_conditions.")
+        sel_df = pd.read_csv(sel_csv)
+        selected_condition_ids = [cell_to_str(x) for x in sel_df.get("condition_id", []).tolist() if cell_to_str(x)]
+
+    if not selected_condition_ids:
+        raise PipelineError("No selected rescue conditions available for phase6.")
+    missing = [cid for cid in selected_condition_ids if cid not in all_cond_map]
+    if missing:
+        raise PipelineError(f"Phase6 selected condition(s) not found in phase5 parent/hotspot matrix: {missing}")
+
+    selected_conditions = [all_cond_map[cid] for cid in selected_condition_ids]
+    summaries = run_cdr1_rescue_design(
+        phase_name="phase6_cdr1_rescue_main",
+        conditions=selected_conditions,
+        context=context,
+        args=args,
+        backbones_target=int(phase_cfg.get("backbones_per_combination", phase6_cfg.get("backbones_per_condition", 300))),
+        seqs_per_backbone=int(phase_cfg.get("sequences_per_backbone", phase6_cfg.get("sequences_per_backbone", 2))),
+        editable_positions=editable_positions,
+        strict_cfg=strict_cfg,
+        relaxed_cfg=relaxed_cfg,
+    )
+    atomic_write_csv(
+        root / "results/summaries/phase6_cdr1_rescue_main_summary.csv",
+        summaries,
+        list(summaries[0].keys()) if summaries else [],
+    )
+
+    phase_dir = root / "phase6_cdr1_rescue_main" / "conditions"
+    all_rows: List[dict] = []
+    if phase_dir.exists():
+        for cdir in sorted(phase_dir.iterdir()):
+            cfile = cdir / "candidates.csv"
+            if cfile.exists():
+                all_rows.extend(pd.read_csv(cfile).to_dict(orient="records"))
+    if not all_rows:
+        raise PipelineError("Phase6 generated no candidate rows.")
+
+    df = pd.DataFrame(all_rows)
+    df["strict_pass"] = df["strict_pass"].astype(int)
+    df["relaxed_pass"] = df["relaxed_pass"].astype(int)
+    df["ranking_score"] = df["ranking_score"].astype(float)
+    df["rf2_pae"] = df["rf2_pae"].astype(float)
+    df["design_rf2_rmsd"] = df["design_rf2_rmsd"].astype(float)
+    ranked_df = df.sort_values(
+        ["strict_pass", "relaxed_pass", "ranking_score", "design_rf2_rmsd", "rf2_pae"],
+        ascending=[False, False, False, True, True],
+    )
+    ranked_df = ranked_df.drop_duplicates(subset=["full_sequence"], keep="first")
+
+    dedup_threshold = float(rescue_cfg.get("cdr1_rescue", {}).get("dedup_identity_threshold", 0.95))
+    deduped = greedy_sequence_dedup(
+        rows=ranked_df.to_dict(orient="records"),
+        sequence_key="full_sequence",
+        score_key="ranking_score",
+        identity_threshold=dedup_threshold,
+    )
+    final_ranked = sorted(
+        deduped,
+        key=lambda x: (
+            int(x.get("strict_pass", 0)),
+            int(x.get("relaxed_pass", 0)),
+            float(x.get("ranking_score", 0.0)),
+            -float(x.get("design_rf2_rmsd", 999.0)),
+            -float(x.get("rf2_pae", 999.0)),
+        ),
+        reverse=True,
+    )
+    top_n = int(phase6_cfg.get("final_top_n", context["pipeline_cfg"].get("af3_handoff", {}).get("export_top_n", 25)))
+    top25 = final_ranked[:top_n]
+
+    out_rank = root / "results/summaries/phase6_cdr1_rescue_final_ranked_candidates.csv"
+    out_top = root / "results/summaries/final25_cdr1_rescue_candidates.csv"
+    fields = list(top25[0].keys()) if top25 else list(final_ranked[0].keys())
+    atomic_write_csv(out_rank, final_ranked, fields)
+    atomic_write_csv(out_top, top25, fields)
+    atomic_write_csv(root / "results/summaries/final_25_cdr1_rescue_candidates_table.csv", top25, fields)
+
+    fasta_path = root / "results/final_25/final25_cdr1_rescue_sequences.fasta"
+    fasta_path.parent.mkdir(parents=True, exist_ok=True)
+    with fasta_path.open("w", encoding="utf-8") as handle:
+        for row in top25:
+            handle.write(f">{row['candidate_id']}\n{row['full_sequence']}\n")
+
+    export_af3_handoff_custom(
+        context=context,
+        final_rows=top25,
+        outdir=root / "results/af3_web_exports_cdr1_rescue",
+    )
 
 
 def run_phase_design(
@@ -1828,6 +2885,8 @@ def write_project_summary(context: dict):
         ("phase2_focused_pilot", root / "results/summaries/phase2_focused_pilot_summary.csv"),
         ("phase3_main_campaign", root / "results/summaries/phase3_main_campaign_summary.csv"),
         ("phase4_h2_refine", root / "results/summaries/phase4_h2_refine_summary.csv"),
+        ("phase5_cdr1_rescue_pilot", root / "results/summaries/phase5_cdr1_rescue_pilot_summary.csv"),
+        ("phase6_cdr1_rescue_main", root / "results/summaries/phase6_cdr1_rescue_main_summary.csv"),
     ]
 
     lines = [SAFETY_ETHICS_STATEMENT, "", "# Pipeline Summary", ""]
@@ -1885,6 +2944,10 @@ def run_single_phase(phase_name: str, context: dict, args: argparse.Namespace):
         run_phase_design(phase_name=phase_name, combinations=combos, context=context, args=args)
     elif phase_name == "phase4_h2_refine":
         run_phase4_h2_refine(context=context, args=args)
+    elif phase_name == "phase5_cdr1_rescue_pilot":
+        run_phase5_cdr1_rescue_pilot(context=context, args=args)
+    elif phase_name == "phase6_cdr1_rescue_main":
+        run_phase6_cdr1_rescue_main(context=context, args=args)
     else:
         raise PipelineError(f"Unsupported phase: {phase_name}")
 
@@ -1941,6 +3004,8 @@ def main() -> int:
         "phase2_focused_pilot",
         "phase3_main_campaign",
         "phase4_h2_refine",
+        "phase5_cdr1_rescue_pilot",
+        "phase6_cdr1_rescue_main",
     ]
 
     if args.phase == "all":

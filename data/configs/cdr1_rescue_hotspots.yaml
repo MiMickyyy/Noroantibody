@@ -1,0 +1,10 @@
+cdr1_rescue_hotspot_sets:
+  Set_1_polar_anchor:
+    description: "WT-inspired polar anchor patch around residue 53 neighborhood"
+    residues: [49, 50, 51, 53]
+  Set_2_hydrophobic_support:
+    description: "WT-inspired hydrophobic support patch"
+    residues: [238, 241, 256, 290]
+  Set_3_hybrid_anchor:
+    description: "Hybrid anchor set combining polar and hydrophobic support"
+    residues: [53, 238, 241, 290]

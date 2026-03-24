@@ -1,0 +1,37 @@
+phase5:
+  parent_candidate_ids:
+    - campaign_C_A_plus_pocket_rim_HBGA_adjacent_H113_H311_bb062_s01__H2v03
+    - campaign_C_A_plus_pocket_rim_HBGA_adjacent_H113_H311_bb064_s01__H2v04
+  # Optional exact-sequence override keyed by candidate_id.
+  # If provided, resolver priority is:
+  # 1) phase5.parent_full_sequences
+  # 2) af3_final25_nanobody.fasta
+  # 3) existing summary tables
+  parent_full_sequences: {}
+  # parent_full_sequences:
+  #   campaign_C_A_plus_pocket_rim_HBGA_adjacent_H113_H311_bb062_s01__H2v03: "YOUR_FULL_SEQUENCE_121AA"
+  #   campaign_C_A_plus_pocket_rim_HBGA_adjacent_H113_H311_bb064_s01__H2v04: "YOUR_FULL_SEQUENCE_121AA"
+  hotspot_set_names:
+    - Set_1_polar_anchor
+    - Set_2_hydrophobic_support
+    - Set_3_hybrid_anchor
+  backbones_per_condition: 50
+  sequences_per_backbone: 1
+
+phase6:
+  selection_mode: auto
+  top_conditions: 1
+  manual_selected_conditions: []
+  backbones_per_condition: 300
+  sequences_per_backbone: 2
+  final_top_n: 25
+
+cdr1_rescue:
+  editable_positions: [26, 27, 28, 30, 31, 32]
+  strict_thresholds:
+    rf2_pae_max: 10.0
+    design_rf2_rmsd_max: 2.0
+  relaxed_thresholds:
+    rf2_pae_max: 12.0
+    design_rf2_rmsd_max: 2.5
+  dedup_identity_threshold: 0.95

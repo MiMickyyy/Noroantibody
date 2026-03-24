@@ -32,6 +32,8 @@ Not included by design:
 ├── phase2_focused_pilot/
 ├── phase3_main_campaign/
 ├── phase4_h2_refine/
+├── phase5_cdr1_rescue_pilot/
+├── phase6_cdr1_rescue_main/
 ├── results/
 │   ├── summaries/
 │   ├── rf2_passed/
@@ -172,6 +174,8 @@ python scripts/run_pipeline.py --phase phase1_coarse_pilot
 python scripts/run_pipeline.py --phase phase2_focused_pilot
 python scripts/run_pipeline.py --phase phase3_main_campaign
 python scripts/run_pipeline.py --phase phase4_h2_refine
+python scripts/run_pipeline.py --phase phase5_cdr1_rescue_pilot
+python scripts/run_pipeline.py --phase phase6_cdr1_rescue_main
 ```
 
 Phase4 custom selected table (recommended when you manually pick 25 from phase3):
@@ -224,6 +228,8 @@ bash scripts/run_phase1.sh
 bash scripts/run_phase2.sh
 bash scripts/run_phase3.sh
 bash scripts/run_phase4.sh
+bash scripts/run_phase5.sh
+bash scripts/run_phase6.sh
 ```
 
 ### Dry-run and limited debug batch
@@ -311,6 +317,65 @@ Outputs:
   - keep backbone + H1 + H3 fixed
   - RF2 filter and keep best H2 variant per candidate
   - output final top 25
+- Phase 5 (CDR1 rescue pilot):
+  - input parents (fixed):  
+    - `campaign_C_A_plus_pocket_rim_HBGA_adjacent_H113_H311_bb062_s01__H2v03`  
+    - `campaign_C_A_plus_pocket_rim_HBGA_adjacent_H113_H311_bb064_s01__H2v04`
+  - hotspot sets: 3 WT-inspired narrow sets (`Set_1_polar_anchor`, `Set_2_hydrophobic_support`, `Set_3_hybrid_anchor`)
+  - 2 parents × 3 sets × 50 backbones × 1 seq = 300 sequence-level candidates
+  - ranks all 6 parent×hotspot conditions using strict/relaxed pass counts as primary criteria
+- Phase 6 (CDR1 rescue main):
+  - expands best-performing Phase5 condition(s) (default top 1, configurable)
+  - default: 300 backbones × 2 seq = 600 sequence-level candidates
+  - RF2 filtering + sequence de-duplication + near-clonal de-duplication + Final Top25 export
+
+## CDR1 Rescue Increment (Phase5/6)
+
+This repository now includes a targeted post-H2 CDR1 rescue stage (incremental extension, not a restart).
+
+- Goal:
+  - recover WT-like CDR1 interface behavior while preserving previously selected engineered parent contexts
+- Design scope:
+  - only CDR1 positions `26/27/28/30/31/32` are editable in rescue sequence post-processing
+  - H2 and H3 are kept fixed to parent sequences
+  - CDR1 loop length is fixed (no broad loop-length sweep)
+- Hotspot scope:
+  - dedicated WT-inspired narrow hotspot sets are defined in:
+    - `data/configs/cdr1_rescue_hotspots.yaml`
+  - these do **not** overwrite earlier phase hotspot campaigns
+- Parent resolver:
+  - exact parent IDs are read from:
+    - `data/configs/cdr1_rescue_phase.yaml`
+  - and resolved against existing final tables (no generic placeholder renaming)
+
+### Rescue config files
+
+- `data/configs/cdr1_rescue_phase.yaml`
+  - parent candidate IDs
+  - optional exact parent sequence overrides (`phase5.parent_full_sequences`)
+  - editable CDR1 positions
+  - strict/relaxed thresholds
+  - phase5/phase6 design counts
+  - phase6 selection mode (`auto` or manual condition IDs)
+- `data/configs/cdr1_rescue_hotspots.yaml`
+  - 3 WT-inspired CDR1 rescue hotspot sets
+
+### Rescue execution
+
+```bash
+python scripts/run_pipeline.py --phase phase5_cdr1_rescue_pilot --execute --resume
+python scripts/run_pipeline.py --phase phase6_cdr1_rescue_main --execute --resume
+```
+
+Rescue summaries:
+
+```bash
+python scripts/summarize_cdr1_rescue.py
+```
+
+Rescue Final Top25 AF3 handoff output directory:
+
+- `results/af3_web_exports_cdr1_rescue/`
 
 ## Filtering and ranking defaults
 

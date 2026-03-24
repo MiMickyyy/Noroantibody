@@ -27,6 +27,28 @@ from pipeline_common import (
 )
 
 AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
+AA1_TO_AA3 = {
+    "A": "ALA",
+    "C": "CYS",
+    "D": "ASP",
+    "E": "GLU",
+    "F": "PHE",
+    "G": "GLY",
+    "H": "HIS",
+    "I": "ILE",
+    "K": "LYS",
+    "L": "LEU",
+    "M": "MET",
+    "N": "ASN",
+    "P": "PRO",
+    "Q": "GLN",
+    "R": "ARG",
+    "S": "SER",
+    "T": "THR",
+    "V": "VAL",
+    "W": "TRP",
+    "Y": "TYR",
+}
 
 
 @dataclass
@@ -301,6 +323,7 @@ def run_rfdiffusion_backbone(
     seed: int,
     log_file: Path,
     dry_run: bool,
+    design_loops: Optional[str] = None,
 ):
     out_pdb.parent.mkdir(parents=True, exist_ok=True)
     if dry_run or not cfg.execute_real_tools:
@@ -336,6 +359,10 @@ def run_rfdiffusion_backbone(
 
     out_prefix = str(out_pdb.with_suffix(""))
 
+    design_loops_spec = (design_loops or f"H1:{h1_len},H2:{h2_len},H3:{h3_len}").strip()
+    if not design_loops_spec:
+        raise PipelineError("RFdiffusion design_loops specification is empty.")
+
     def build_cmd(*, deterministic: bool, diffuser_t: int) -> List[str]:
         cmd = list(cfg.rfdiffusion_prefix)
         if _is_cli_prefix(cmd, "rfdiffusion"):
@@ -349,7 +376,7 @@ def run_rfdiffusion_backbone(
                 "--num-designs",
                 "1",
                 "--design-loops",
-                f"H1:{h1_len},H2:{h2_len},H3:{h3_len}",
+                design_loops_spec,
                 "--diffuser-t",
                 str(diffuser_t),
                 "--final-step",
@@ -372,7 +399,7 @@ def run_rfdiffusion_backbone(
                 f"antibody.framework_pdb={str(safe_framework_pdb)}",
                 f"inference.output_prefix={out_prefix}",
                 "inference.num_designs=1",
-                f"antibody.design_loops=[H1:{h1_len},H2:{h2_len},H3:{h3_len}]",
+                f"antibody.design_loops=[{','.join([x.strip() for x in design_loops_spec.split(',') if x.strip()])}]",
                 f"diffuser.T={diffuser_t}",
                 "inference.final_step=1",
                 "inference.write_trajectory=False",
@@ -429,6 +456,62 @@ def run_rfdiffusion_backbone(
     raise PipelineError(
         f"RFdiffusion finished but expected output not found for {backbone_id}. Checked: {', '.join(str(x) for x in candidates)}"
     )
+
+
+def thread_sequence_on_backbone_pose(
+    backbone_pdb: Path,
+    binder_sequence: str,
+    out_pdb: Path,
+    binder_chain: str = "H",
+) -> Path:
+    """Thread a 1-letter binder sequence onto a backbone-only RFantibody Pose and write PDB.
+
+    Uses RFantibody's Pose utility to preserve H/L/T REMARK annotations required by downstream
+    ProteinMPNN/RF2 scripts.
+    """
+    if not backbone_pdb.exists():
+        raise PipelineError(f"Cannot thread sequence: missing backbone PDB {backbone_pdb}")
+    seq = str(binder_sequence).strip().upper()
+    if not seq:
+        raise PipelineError("Cannot thread empty binder sequence.")
+
+    try:
+        from rfantibody.util.pose import Pose
+    except Exception as exc:  # pragma: no cover - import guard for env issues
+        raise PipelineError(
+            "Failed to import rfantibody.util.pose for sequence threading. "
+            "Ensure RFantibody is installed in the active environment."
+        ) from exc
+
+    pose = Pose.from_pdb(str(backbone_pdb))
+    chain_array = [str(x) for x in pose.chain.tolist()]
+    binder_indices = [i for i, ch in enumerate(chain_array) if ch == binder_chain]
+    if not binder_indices:
+        # Fallback to first non-target chain.
+        non_target = sorted(set(ch for ch in chain_array if ch != "T"))
+        if not non_target:
+            raise PipelineError(
+                f"Cannot locate binder chain in backbone pose {backbone_pdb}; chains found: {sorted(set(chain_array))}"
+            )
+        binder_chain = non_target[0]
+        binder_indices = [i for i, ch in enumerate(chain_array) if ch == binder_chain]
+
+    if len(binder_indices) != len(seq):
+        raise PipelineError(
+            f"Binder length mismatch for threaded sequence on {backbone_pdb}: "
+            f"chain {binder_chain} has {len(binder_indices)} residues, sequence has {len(seq)} residues."
+        )
+
+    for offset, pose_idx in enumerate(binder_indices):
+        aa1 = seq[offset]
+        aa3 = AA1_TO_AA3.get(aa1)
+        if not aa3:
+            raise PipelineError(f"Unsupported amino acid '{aa1}' while threading sequence.")
+        pose.mutate_residue(chain=binder_chain, residx=pose_idx, newres=aa3)
+
+    out_pdb.parent.mkdir(parents=True, exist_ok=True)
+    pose.dump_pdb(str(out_pdb))
+    return out_pdb
 
 
 def run_proteinmpnn_sequence_design(

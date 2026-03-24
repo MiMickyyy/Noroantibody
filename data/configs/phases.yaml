@@ -30,3 +30,13 @@ phases:
     input_from_phase: phase3_main_campaign
     input_top_candidates: 25
     h2_variants_per_candidate: 4
+  phase5_cdr1_rescue_pilot:
+    description: "CDR1 rescue pilot from two AF3 5/5-pass parents (2x3 conditions, 50 backbones, 1 seq each)"
+    input_from_phase: phase4_h2_refine
+    backbones_per_combination: 50
+    sequences_per_backbone: 1
+  phase6_cdr1_rescue_main:
+    description: "CDR1 rescue expansion on selected best condition(s) (default 1 condition, 300 backbones, 2 seq each)"
+    input_from_phase: phase5_cdr1_rescue_pilot
+    backbones_per_combination: 300
+    sequences_per_backbone: 2
