@@ -1533,17 +1533,45 @@ def run_cdr1_rescue_design(
                     proposed_full_seq=proposed_seq,
                     editable_positions=editable_positions,
                 )
+                threading_warning = ""
 
                 threaded_pdb = cdir / "mpnn_aux" / bb_id / f"{cid}_threaded.pdb"
+                designed_pdb_fallback = Path(cell_to_str(record.get("designed_pdb")) or str(bb_pdb))
                 if args.dry_run or not tooling.execute_real_tools:
                     threaded_pdb = bb_pdb
                 else:
-                    thread_sequence_on_backbone_pose(
-                        backbone_pdb=bb_pdb,
-                        binder_sequence=constrained_seq,
-                        out_pdb=threaded_pdb,
-                        binder_chain=context["cdr"].chain_id or "H",
-                    )
+                    try:
+                        thread_sequence_on_backbone_pose(
+                            backbone_pdb=bb_pdb,
+                            binder_sequence=constrained_seq,
+                            out_pdb=threaded_pdb,
+                            binder_chain=context["cdr"].chain_id or "H",
+                        )
+                    except PipelineError as exc:
+                        emsg = str(exc)
+                        if "Failed to import rfantibody.util.pose" in emsg:
+                            if designed_pdb_fallback.exists():
+                                threaded_pdb = designed_pdb_fallback
+                                if constrained_seq != proposed_seq:
+                                    constrained_seq = proposed_seq
+                                    edited_pos = []
+                                    threading_warning = (
+                                        "Pose-threading unavailable (rfantibody import failed); "
+                                        "using ProteinMPNN designed_pdb directly, and rescue edit-mask "
+                                        "was not strictly enforced for this candidate."
+                                    )
+                                else:
+                                    threading_warning = (
+                                        "Pose-threading unavailable (rfantibody import failed); "
+                                        "using ProteinMPNN designed_pdb directly."
+                                    )
+                            else:
+                                raise PipelineError(
+                                    f"Threading failed and ProteinMPNN fallback PDB is missing for {cid}: "
+                                    f"{designed_pdb_fallback}"
+                                ) from exc
+                        else:
+                            raise
 
                 rf2_json = cdir / "rf2_metrics" / f"{cid}_rf2.json"
                 metrics = run_rf2_filter(
@@ -1580,10 +1608,14 @@ def run_cdr1_rescue_design(
                     strict_cfg=strict_cfg,
                     relaxed_cfg=relaxed_cfg,
                 )
-                warning = mask_warning
+                warning_parts: List[str] = []
+                if mask_warning:
+                    warning_parts.append(mask_warning)
+                if threading_warning:
+                    warning_parts.append(threading_warning)
                 if edited_pos:
-                    extra = f"CDR1 editable positions changed: {','.join(str(x) for x in edited_pos)}"
-                    warning = f"{warning} | {extra}" if warning else extra
+                    warning_parts.append(f"CDR1 editable positions changed: {','.join(str(x) for x in edited_pos)}")
+                warning = " | ".join(warning_parts)
 
                 try:
                     h1_seq_c, h2_seq_c, h3_seq_c = split_designed_sequence(
