@@ -1961,7 +1961,9 @@ def run_phase6_cdr1_rescue_main(context: dict, args: argparse.Namespace):
     phase_dir = root / "phase6_cdr1_rescue_main" / "conditions"
     all_rows: List[dict] = []
     if phase_dir.exists():
-        for cdir in sorted(phase_dir.iterdir()):
+        # Read only selected phase6 condition directories to avoid contamination from stale runs.
+        for cond in selected_conditions:
+            cdir = phase_dir / cond.phase_condition_id
             cfile = cdir / "candidates.csv"
             if cfile.exists():
                 all_rows.extend(pd.read_csv(cfile).to_dict(orient="records"))
@@ -1974,49 +1976,91 @@ def run_phase6_cdr1_rescue_main(context: dict, args: argparse.Namespace):
     df["ranking_score"] = df["ranking_score"].astype(float)
     df["rf2_pae"] = df["rf2_pae"].astype(float)
     df["design_rf2_rmsd"] = df["design_rf2_rmsd"].astype(float)
-    ranked_df = df.sort_values(
-        ["strict_pass", "relaxed_pass", "ranking_score", "design_rf2_rmsd", "rf2_pae"],
-        ascending=[False, False, False, True, True],
-    )
+    df["rf2_sum_score"] = df["rf2_pae"] + df["design_rf2_rmsd"]
+    # Phase6 RF2-only ranking: normalize first, then aggregate.
+    # Requested normalization: RMSD/10, pAE/2; lower combined score is better.
+    df["rf2_rmsd_norm"] = df["design_rf2_rmsd"] / 10.0
+    df["rf2_pae_norm"] = df["rf2_pae"] / 2.0
+    df["rf2_norm_score"] = df["rf2_rmsd_norm"] + df["rf2_pae_norm"]
+
+    ranking_mode = cell_to_str(phase6_cfg.get("ranking_mode", "strict_then_ranking")).lower()
+    use_rf2_sum_mode = ranking_mode in {"rf2_sum", "rf2_rmsd_pae", "rf2_pae_rmsd"}
+
+    if use_rf2_sum_mode:
+        ranked_df = df.sort_values(
+            ["rf2_norm_score", "rf2_pae_norm", "rf2_rmsd_norm", "rf2_pae", "design_rf2_rmsd"],
+            ascending=[True, True, True, True, True],
+        )
+        # greedy_sequence_dedup keeps highest score, so negate for min-objective mode.
+        ranked_df["dedup_score"] = -ranked_df["rf2_norm_score"]
+    else:
+        ranked_df = df.sort_values(
+            ["strict_pass", "relaxed_pass", "ranking_score", "design_rf2_rmsd", "rf2_pae"],
+            ascending=[False, False, False, True, True],
+        )
+        ranked_df["dedup_score"] = ranked_df["ranking_score"]
     ranked_df = ranked_df.drop_duplicates(subset=["full_sequence"], keep="first")
 
     dedup_threshold = float(rescue_cfg.get("cdr1_rescue", {}).get("dedup_identity_threshold", 0.95))
     deduped = greedy_sequence_dedup(
         rows=ranked_df.to_dict(orient="records"),
         sequence_key="full_sequence",
-        score_key="ranking_score",
+        score_key="dedup_score",
         identity_threshold=dedup_threshold,
     )
-    final_ranked = sorted(
-        deduped,
-        key=lambda x: (
-            int(x.get("strict_pass", 0)),
-            int(x.get("relaxed_pass", 0)),
-            float(x.get("ranking_score", 0.0)),
-            -float(x.get("design_rf2_rmsd", 999.0)),
-            -float(x.get("rf2_pae", 999.0)),
-        ),
-        reverse=True,
-    )
+    if use_rf2_sum_mode:
+        final_ranked = sorted(
+            deduped,
+            key=lambda x: (
+                float(x.get("rf2_norm_score", 999.0)),
+                float(x.get("rf2_pae_norm", 999.0)),
+                float(x.get("rf2_rmsd_norm", 999.0)),
+                float(x.get("rf2_pae", 999.0)),
+                float(x.get("design_rf2_rmsd", 999.0)),
+            ),
+        )
+    else:
+        final_ranked = sorted(
+            deduped,
+            key=lambda x: (
+                int(x.get("strict_pass", 0)),
+                int(x.get("relaxed_pass", 0)),
+                float(x.get("ranking_score", 0.0)),
+                -float(x.get("design_rf2_rmsd", 999.0)),
+                -float(x.get("rf2_pae", 999.0)),
+            ),
+            reverse=True,
+        )
+
+    for idx, row in enumerate(final_ranked, 1):
+        row["phase6_rank"] = idx
+        row["phase6_ranking_mode"] = "rf2_norm_sum" if use_rf2_sum_mode else "strict_then_ranking"
     top_n = int(phase6_cfg.get("final_top_n", context["pipeline_cfg"].get("af3_handoff", {}).get("export_top_n", 25)))
-    top25 = final_ranked[:top_n]
+    top_rows = final_ranked[:top_n]
+    top_label = f"final{top_n}"
 
     out_rank = root / "results/summaries/phase6_cdr1_rescue_final_ranked_candidates.csv"
-    out_top = root / "results/summaries/final25_cdr1_rescue_candidates.csv"
-    fields = list(top25[0].keys()) if top25 else list(final_ranked[0].keys())
+    out_top = root / f"results/summaries/{top_label}_cdr1_rescue_candidates.csv"
+    out_table = root / f"results/summaries/final_{top_n}_cdr1_rescue_candidates_table.csv"
+    fields = list(top_rows[0].keys()) if top_rows else list(final_ranked[0].keys())
     atomic_write_csv(out_rank, final_ranked, fields)
-    atomic_write_csv(out_top, top25, fields)
-    atomic_write_csv(root / "results/summaries/final_25_cdr1_rescue_candidates_table.csv", top25, fields)
+    atomic_write_csv(out_top, top_rows, fields)
+    atomic_write_csv(out_table, top_rows, fields)
 
-    fasta_path = root / "results/final_25/final25_cdr1_rescue_sequences.fasta"
+    # Keep legacy filenames for backward compatibility when top_n==25.
+    if top_n == 25:
+        atomic_write_csv(root / "results/summaries/final25_cdr1_rescue_candidates.csv", top_rows, fields)
+        atomic_write_csv(root / "results/summaries/final_25_cdr1_rescue_candidates_table.csv", top_rows, fields)
+
+    fasta_path = root / f"results/final_{top_n}/{top_label}_cdr1_rescue_sequences.fasta"
     fasta_path.parent.mkdir(parents=True, exist_ok=True)
     with fasta_path.open("w", encoding="utf-8") as handle:
-        for row in top25:
+        for row in top_rows:
             handle.write(f">{row['candidate_id']}\n{row['full_sequence']}\n")
 
     export_af3_handoff_custom(
         context=context,
-        final_rows=top25,
+        final_rows=top_rows,
         outdir=root / "results/af3_web_exports_cdr1_rescue",
     )
 

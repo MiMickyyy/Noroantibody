@@ -19,12 +19,14 @@ phase5:
   sequences_per_backbone: 1
 
 phase6:
-  selection_mode: auto
+  selection_mode: manual
   top_conditions: 1
-  manual_selected_conditions: []
+  manual_selected_conditions:
+    - campaign_C_A_plus_pocket_rim_HBGA_adjacent_H113_H311_bb062_s01__H2v03__Set_1_polar_anchor
+  ranking_mode: rf2_sum
   backbones_per_condition: 300
   sequences_per_backbone: 2
-  final_top_n: 25
+  final_top_n: 30
 
 cdr1_rescue:
   editable_positions: [26, 27, 28, 30, 31, 32]
