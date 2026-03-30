@@ -1,0 +1,38 @@
+test1_local_maturation:
+  # Keep this as Test1 to auto-resolve from existing summaries.
+  parent_candidate_ref: Test1
+  # Explicit Test1 ID/sequence fallback (used if summary alias mapping is missing).
+  test1_real_candidate_id: campaign_C_A_plus_pocket_rim_HBGA_adjacent_H113_H311_bb062_s01_H2v03_Set_1_polar_anchor_bb029_s01
+  test1_full_sequence: QVQLQESGGGLVQPGGSLRLSCTYTPKPAHNVVAYGWYRQAPEKQRELVATGAVGGNVGYADSVKGRFTISRDNAKRTVYLQMNDLKPEDAAVYYCNIIDDSAVRYEGQGTQVTVSSHHHHHH
+  # Optional explicit structure path for Test1 parent (set on VM if auto-derivation fails).
+  test1_parent_structure_pdb: ""
+
+  # Total candidates = candidates_per_branch x number_of_branches.
+  candidate_count_per_branch: 50
+
+  # Shared hotspot set for both branches.
+  hotspot_set_name: Test1_defect_guided
+
+  # Preserve Test1 core primary-contact residues.
+  fixed_core_positions: [27, 28, 29, 30, 33, 34]
+
+  # Local sequence mutation controls (fixed-backbone threading + RF2).
+  aa_alphabet: ACDEFGHIKLMNPQRSTVWY
+  min_mutations_per_candidate: 1
+  max_mutations_per_candidate: 3
+
+  strict_thresholds:
+    rf2_pae_max: 10.0
+    design_rf2_rmsd_max: 2.0
+  relaxed_thresholds:
+    rf2_pae_max: 12.0
+    design_rf2_rmsd_max: 2.5
+
+  top_n_per_branch_for_summary: 3
+
+  branches:
+    Branch_A_H1_edge_only:
+      editable_positions: ["H1:25", "H1:26", "H1:31", "H1:32"]
+
+    Branch_B_H1_plus_FR_support:
+      editable_positions: ["H1:25", "H1:26", "H1:31", "H1:32", "FR:35", "FR:36", "FR:37", "FR:39"]

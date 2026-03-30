@@ -76,6 +76,23 @@ class RescueCondition:
     hotspot_tokens: List[str]
 
 
+@dataclass
+class LocalMaturationBranch:
+    branch_name: str
+    phase_branch_id: str
+    editable_positions: List[int]
+
+
+DEFAULT_TEST1_REAL_CANDIDATE_ID = (
+    "campaign_C_A_plus_pocket_rim_HBGA_adjacent_H113_H311_"
+    "bb062_s01_H2v03_Set_1_polar_anchor_bb029_s01"
+)
+DEFAULT_TEST1_FULL_SEQUENCE = (
+    "QVQLQESGGGLVQPGGSLRLSCTYTPKPAHNVVAYGWYRQAPEKQRELVATGAVGGNVG"
+    "YADSVKGRFTISRDNAKRTVYLQMNDLKPEDAAVYYCNIIDDSAVRYEGQGTQVTVSSHHHHHH"
+)
+
+
 def parse_model(structure_path: Path):
     sfx = structure_path.suffix.lower()
     if sfx in {".cif", ".mmcif"}:
@@ -171,6 +188,7 @@ def parse_args() -> argparse.Namespace:
             "phase4_h2_refine",
             "phase5_cdr1_rescue_pilot",
             "phase6_cdr1_rescue_main",
+            "phase_next_test1_local_maturation",
             "all",
         ],
     )
@@ -184,6 +202,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resolved-targets", default="data/processed/resolved_targets.yaml")
     parser.add_argument("--cdr1-rescue-config", default="data/configs/cdr1_rescue_phase.yaml")
     parser.add_argument("--cdr1-rescue-hotspots", default="data/configs/cdr1_rescue_hotspots.yaml")
+    parser.add_argument(
+        "--test1-local-maturation-config",
+        default="data/configs/test1_local_maturation_phase.yaml",
+    )
+    parser.add_argument(
+        "--test1-local-maturation-hotspots",
+        default="data/configs/test1_local_maturation_hotspots.yaml",
+    )
     parser.add_argument(
         "--phase2-selection-config",
         default="data/configs/phase2_selected_combinations.yaml",
@@ -284,6 +310,12 @@ def load_base_context(args: argparse.Namespace) -> dict:
     cdr1_rescue_hotspots = (
         read_yaml(cdr1_rescue_hotspot_path) if cdr1_rescue_hotspot_path.exists() else {}
     )
+    test1_local_cfg_path = root / args.test1_local_maturation_config
+    test1_local_hotspot_path = root / args.test1_local_maturation_hotspots
+    test1_local_cfg = read_yaml(test1_local_cfg_path) if test1_local_cfg_path.exists() else {}
+    test1_local_hotspots = (
+        read_yaml(test1_local_hotspot_path) if test1_local_hotspot_path.exists() else {}
+    )
 
     # Normalize known path-like fields to absolute paths for robust execution
     for key in (
@@ -364,6 +396,10 @@ def load_base_context(args: argparse.Namespace) -> dict:
         "cdr1_rescue_hotspot_path": str(cdr1_rescue_hotspot_path),
         "cdr1_rescue_cfg": cdr1_rescue_cfg,
         "cdr1_rescue_hotspots": cdr1_rescue_hotspots,
+        "test1_local_cfg_path": str(test1_local_cfg_path),
+        "test1_local_hotspot_path": str(test1_local_hotspot_path),
+        "test1_local_cfg": test1_local_cfg,
+        "test1_local_hotspots": test1_local_hotspots,
     }
 
 
@@ -2065,6 +2101,801 @@ def run_phase6_cdr1_rescue_main(context: dict, args: argparse.Namespace):
     )
 
 
+def parse_position_list(values: Sequence[object], field_name: str) -> List[int]:
+    out: List[int] = []
+    for item in values:
+        token = cell_to_str(item)
+        if not token:
+            continue
+        nums = re.findall(r"-?\d+", token)
+        if not nums:
+            raise PipelineError(f"Invalid position token '{token}' in {field_name}.")
+        out.append(int(nums[-1]))
+    uniq = sorted(set(x for x in out if x > 0))
+    if not uniq:
+        raise PipelineError(f"No valid residue positions found in {field_name}.")
+    return uniq
+
+
+def build_test1_local_hotspot_set(hotspot_cfg: dict, set_name: str) -> Dict[str, object]:
+    sets = hotspot_cfg.get("test1_local_maturation_hotspot_sets", {})
+    if not sets:
+        raise PipelineError(
+            "Missing test1_local_maturation_hotspot_sets in data/configs/test1_local_maturation_hotspots.yaml"
+        )
+    if set_name not in sets:
+        raise PipelineError(f"Unknown test1 local maturation hotspot set: {set_name}")
+    node = sets[set_name] or {}
+    tokens = [cell_to_str(x) for x in node.get("tokens", []) if cell_to_str(x)]
+    if not tokens:
+        residues = [int(x) for x in node.get("residues", [])]
+        chains = [cell_to_str(x) for x in node.get("chains", []) if cell_to_str(x)]
+        if residues and chains:
+            for ch in chains:
+                for resnum in residues:
+                    tokens.append(f"{ch}{resnum}")
+    if not tokens:
+        raise PipelineError(f"Hotspot set {set_name} has no valid tokens/residues.")
+    return {
+        "set_name": set_name,
+        "tokens": tokens,
+        "residues": hotspot_numbers_from_tokens(tokens),
+        "description": cell_to_str(node.get("description")),
+    }
+
+
+def _candidate_index_for_local_maturation(root: Path) -> Dict[str, Dict[str, object]]:
+    index = _candidate_index_for_rescue(root)
+    source_csvs = [
+        root / "results/summaries/phase6_cdr1_rescue_final_ranked_candidates.csv",
+        root / "results/summaries/final_30_cdr1_rescue_candidates_table.csv",
+        root / "results/summaries/final25_cdr1_rescue_candidates.csv",
+        root / "results/summaries/final_25_cdr1_rescue_candidates_table.csv",
+    ]
+    for cpath in source_csvs:
+        if not cpath.exists():
+            continue
+        try:
+            rows = pd.read_csv(cpath).to_dict(orient="records")
+        except Exception:
+            continue
+        for row in rows:
+            cid = cell_to_str(row.get("candidate_id"))
+            if cid and cid not in index:
+                index[cid] = _normalize_candidate_row(root=root, row=row)
+
+    for phase_name in ("phase5_cdr1_rescue_pilot", "phase6_cdr1_rescue_main"):
+        cond_root = root / phase_name / "conditions"
+        if not cond_root.exists():
+            continue
+        for cfile in cond_root.glob("*/candidates.csv"):
+            try:
+                rows = pd.read_csv(cfile).to_dict(orient="records")
+            except Exception:
+                continue
+            for row in rows:
+                cid = cell_to_str(row.get("candidate_id"))
+                if cid and cid not in index:
+                    index[cid] = _normalize_candidate_row(root=root, row=row)
+    return index
+
+
+def resolve_test1_parent_candidate(context: dict, parent_ref: str, local_cfg: dict) -> dict:
+    root = context["root"]
+    resolved_ref = cell_to_str(parent_ref)
+    alias_source = "explicit_parent_ref"
+
+    if resolved_ref.lower() == "test1":
+        override = cell_to_str(local_cfg.get("test1_real_candidate_id"))
+        if override:
+            resolved_ref = override
+            alias_source = "test1_real_candidate_id_override"
+        else:
+            summary_md = root / "results/summaries/test1_interface_maturation_summary.md"
+            if summary_md.exists():
+                text = summary_md.read_text(encoding="utf-8", errors="ignore")
+                m = re.search(r"Resolved Test1 real candidate ID:\s*`([^`]+)`", text)
+                if m:
+                    resolved_ref = cell_to_str(m.group(1))
+                    alias_source = "test1_interface_maturation_summary.md"
+            if resolved_ref.lower() == "test1":
+                resolved_ref = DEFAULT_TEST1_REAL_CANDIDATE_ID
+                alias_source = "hardcoded_default_test1_id"
+
+    index = _candidate_index_for_local_maturation(root)
+    row: Optional[dict] = None
+    sequence_override = ""
+    def _preferred_structure_path(crow: dict) -> str:
+        return (
+            cell_to_str(crow.get("rf2_best_pdb"))
+            or cell_to_str(crow.get("threaded_pdb"))
+            or cell_to_str(crow.get("designed_pdb"))
+            or cell_to_str(crow.get("backbone_pdb"))
+            or cell_to_str(crow.get("parent_backbone_pdb"))
+        )
+
+    def _has_real_structure(crow: dict) -> bool:
+        p = _preferred_structure_path(crow)
+        if not p:
+            return False
+        if "MISSING_PARENT_PDB_PLACEHOLDER" in p:
+            return False
+        try:
+            return Path(p).exists()
+        except Exception:
+            return False
+
+    if resolved_ref in index:
+        row = dict(index[resolved_ref])
+    else:
+        # Fallback: recover Test1 sequence from AF3 renamed summary, and recover structure from
+        # the corresponding parent stem candidate (e.g., ..._H2v03_Set_* -> ...__H2v03).
+        for seq_csv in [
+            root / "results/summaries/af3_fold_test4_15_vs_wt_metrics_renamed.csv",
+            root / "results/summaries/af3_fold_test16_21_vs_wt_metrics.csv",
+        ]:
+            if not seq_csv.exists():
+                continue
+            try:
+                df_seq = pd.read_csv(seq_csv)
+            except Exception:
+                continue
+            if "sequence" not in df_seq.columns:
+                continue
+            id_col = "renamed_candidate_id" if "renamed_candidate_id" in df_seq.columns else "candidate_id"
+            if id_col not in df_seq.columns:
+                continue
+            q = df_seq[df_seq[id_col].astype(str) == resolved_ref]
+            if not q.empty:
+                sequence_override = _normalize_parent_sequence(
+                    cell_to_str(q.iloc[0].get("sequence", "")),
+                    f"{seq_csv.name}:{id_col}",
+                    resolved_ref,
+                )
+                break
+
+        stem = resolved_ref.split("_Set_")[0] if "_Set_" in resolved_ref else resolved_ref
+        parent_stem = re.sub(r"_H2v(\d+)$", r"__H2v\1", stem)
+        # Prefer any same-stem candidate row with an existing structure path.
+        same_stem_rows: List[Tuple[str, dict]] = []
+        for cid, crow in index.items():
+            if cid.startswith(stem + "_Set_") or cid.startswith(stem + "__Set_"):
+                same_stem_rows.append((cid, dict(crow)))
+        same_stem_rows = sorted(
+            same_stem_rows,
+            key=lambda x: (_has_real_structure(x[1]), x[0]),
+            reverse=True,
+        )
+        if same_stem_rows:
+            row = same_stem_rows[0][1]
+            alias_source += f" + same_stem_candidate_fallback({same_stem_rows[0][0]})"
+
+        for probe in [stem, parent_stem]:
+            if row is not None:
+                break
+            if probe in index:
+                row = dict(index[probe])
+                alias_source += f" + stem_fallback({probe})"
+                break
+            for cid, crow in index.items():
+                if cid.startswith(probe + "__H2v"):
+                    row = dict(crow)
+                    alias_source += f" + stem_prefix_fallback({cid})"
+                    break
+            if row is not None:
+                break
+
+        if row is None:
+            # Last-resort fallback: synthesize a parent row from explicit structure path + hardcoded/default sequence.
+            explicit_structure = resolve_path_like(root, cell_to_str(local_cfg.get("test1_parent_structure_pdb", "")))
+            derived_structure_candidates: List[Path] = []
+            base = re.sub(r"_s\\d+$", "", resolved_ref)
+            cond = re.sub(r"_bb\\d+$", "", base)
+            derived_structure_candidates.extend(
+                [
+                    root
+                    / "phase5_cdr1_rescue_pilot"
+                    / "conditions"
+                    / cond
+                    / "rf2_metrics"
+                    / f"{resolved_ref}_rf2_rf2_outputs"
+                    / f"{resolved_ref}_best.pdb",
+                    root / "phase5_cdr1_rescue_pilot" / "conditions" / cond / "backbones" / f"{base}.pdb",
+                    root / "phase6_cdr1_rescue_main" / "conditions" / cond / "backbones" / f"{base}.pdb",
+                    root / "phase6_cdr1_rescue_main" / "conditions" / cond / "backbones" / f"{cond}_bb001.pdb",
+                ]
+            )
+            structure_fallback = None
+            if explicit_structure is not None and explicit_structure.exists():
+                structure_fallback = explicit_structure
+                alias_source += " + explicit_parent_structure"
+            else:
+                for p in derived_structure_candidates:
+                    if p.exists():
+                        structure_fallback = p
+                        alias_source += f" + derived_parent_structure({p.name})"
+                        break
+
+            if structure_fallback is None:
+                raise PipelineError(
+                    f"Resolved Test1 parent candidate '{resolved_ref}' was not found in known tables and "
+                    "no fallback structure was found. Set test1_local_maturation.test1_parent_structure_pdb "
+                    "in data/configs/test1_local_maturation_phase.yaml."
+                )
+
+            row = {
+                "candidate_id": resolved_ref,
+                "full_sequence": "",
+                "rf2_best_pdb": str(structure_fallback),
+                "campaign_name": "test1_local_maturation",
+                "combination_id": "",
+            }
+    config_seq_override = _normalize_parent_sequence(
+        cell_to_str(local_cfg.get("test1_full_sequence", "")),
+        "test1_full_sequence",
+        resolved_ref,
+    ) if cell_to_str(local_cfg.get("test1_full_sequence", "")) else ""
+    default_seq_override = (
+        DEFAULT_TEST1_FULL_SEQUENCE
+        if resolved_ref == DEFAULT_TEST1_REAL_CANDIDATE_ID
+        else ""
+    )
+    full_seq = sequence_override or config_seq_override or default_seq_override or _normalize_parent_sequence(
+        cell_to_str(row.get("full_sequence")),
+        "test1 parent candidate row",
+        resolved_ref,
+    )
+    if not full_seq:
+        raise PipelineError(f"Resolved Test1 parent {resolved_ref} has empty full_sequence.")
+
+    h1_len = parse_int_maybe(row.get("h1_length"), context["cdr"].h1_len)
+    h3_len = parse_int_maybe(row.get("h3_length"), context["cdr"].h3_len)
+    cid_h1, cid_h3 = _parse_h1_h3_from_combo_id(resolved_ref)
+    if cid_h1 is not None:
+        h1_len = int(cid_h1)
+    if cid_h3 is not None:
+        h3_len = int(cid_h3)
+    h1_seq = cell_to_str(row.get("h1_sequence"))
+    h2_seq = cell_to_str(row.get("h2_sequence"))
+    h3_seq = cell_to_str(row.get("h3_sequence"))
+    if not (h1_seq and h2_seq and h3_seq):
+        parts = split_framework_and_cdr(context["nanobody_seq"], context["cdr"])
+        try:
+            h1_guess, h2_guess, h3_guess = split_designed_sequence(
+                parts=parts,
+                full_seq=full_seq,
+                h1_len=h1_len,
+                h3_len=h3_len,
+            )
+            h1_seq = h1_seq or h1_guess
+            h2_seq = h2_seq or h2_guess
+            h3_seq = h3_seq or h3_guess
+        except Exception as exc:
+            raise PipelineError(
+                f"Failed to recover H1/H2/H3 sequences for resolved Test1 parent {resolved_ref}: {exc}"
+            ) from exc
+
+    parent_structure = _preferred_structure_path(row)
+    if not parent_structure:
+        raise PipelineError(
+            f"Resolved Test1 parent {resolved_ref} has no usable structure path for fixed-backbone maturation."
+        )
+
+    out = {
+        "candidate_id": resolved_ref,
+        "alias_source": alias_source,
+        "full_sequence": full_seq,
+        "h1_length": int(h1_len),
+        "h2_length": len(h2_seq),
+        "h3_length": int(h3_len),
+        "h1_sequence": h1_seq,
+        "h2_sequence": h2_seq,
+        "h3_sequence": h3_seq,
+        "structure_pdb": parent_structure,
+        "combination_id": cell_to_str(row.get("combination_id") or row.get("parent_combination_id")),
+        "campaign_name": cell_to_str(row.get("campaign_name") or row.get("parent_campaign_name")),
+    }
+    return out
+
+
+def mutate_local_positions(
+    parent_seq: str,
+    editable_positions: Sequence[int],
+    rng,
+    aa_alphabet: str,
+    min_mutations: int,
+    max_mutations: int,
+) -> Tuple[str, List[int]]:
+    seq = list(str(parent_seq).strip().upper())
+    valid_positions = [p for p in sorted(set(int(x) for x in editable_positions)) if 1 <= p <= len(seq)]
+    if not valid_positions:
+        return "".join(seq), []
+
+    max_m = max(1, min(int(max_mutations), len(valid_positions)))
+    min_m = max(1, min(int(min_mutations), max_m))
+    n_mut = rng.randint(min_m, max_m)
+    selected = rng.sample(valid_positions, n_mut)
+
+    edited: List[int] = []
+    for pos in selected:
+        idx = pos - 1
+        native = seq[idx]
+        options = [aa for aa in aa_alphabet if aa != native]
+        if not options:
+            continue
+        seq[idx] = rng.choice(options)
+        if seq[idx] != native:
+            edited.append(pos)
+
+    # Ensure at least one mutation if possible.
+    if not edited:
+        pos = valid_positions[0]
+        idx = pos - 1
+        native = seq[idx]
+        options = [aa for aa in aa_alphabet if aa != native]
+        if options:
+            seq[idx] = options[0]
+            edited.append(pos)
+    return "".join(seq), sorted(set(edited))
+
+
+def run_phase_next_test1_local_maturation(context: dict, args: argparse.Namespace):
+    root = context["root"]
+    phases = context["phases_cfg"].get("phases", {})
+    phase_cfg = phases.get("phase_next_test1_local_maturation", {})
+    local_cfg_root = context.get("test1_local_cfg", {}) or {}
+    hotspot_cfg_root = context.get("test1_local_hotspots", {}) or {}
+    if not local_cfg_root:
+        raise PipelineError(
+            "Missing local maturation config. Expected: data/configs/test1_local_maturation_phase.yaml"
+        )
+    if not hotspot_cfg_root:
+        raise PipelineError(
+            "Missing local maturation hotspot config. Expected: data/configs/test1_local_maturation_hotspots.yaml"
+        )
+
+    local_cfg = local_cfg_root.get("test1_local_maturation", {})
+    if not local_cfg:
+        raise PipelineError("Missing 'test1_local_maturation' block in local maturation config.")
+
+    parent_ref = (
+        cell_to_str(local_cfg.get("parent_candidate_id"))
+        or cell_to_str(local_cfg.get("parent_candidate_ref"))
+        or "Test1"
+    )
+    parent = resolve_test1_parent_candidate(context=context, parent_ref=parent_ref, local_cfg=local_cfg)
+
+    hotspot_set_name = cell_to_str(local_cfg.get("hotspot_set_name", "Test1_defect_guided"))
+    hotspot_set = build_test1_local_hotspot_set(hotspot_cfg_root, set_name=hotspot_set_name)
+
+    strict_cfg = local_cfg.get("strict_thresholds", {"rf2_pae_max": 10.0, "design_rf2_rmsd_max": 2.0})
+    relaxed_cfg = local_cfg.get("relaxed_thresholds", {"rf2_pae_max": 12.0, "design_rf2_rmsd_max": 2.5})
+    fixed_core_positions = parse_position_list(
+        local_cfg.get("fixed_core_positions", [27, 28, 29, 30, 33, 34]),
+        "test1_local_maturation.fixed_core_positions",
+    )
+
+    raw_branches = local_cfg.get("branches", {})
+    if not isinstance(raw_branches, dict) or not raw_branches:
+        raise PipelineError("test1_local_maturation.branches is empty.")
+    branches: List[LocalMaturationBranch] = []
+    for bname, bcfg in raw_branches.items():
+        editable_positions = parse_position_list(
+            (bcfg or {}).get("editable_positions", []),
+            f"test1_local_maturation.branches.{bname}.editable_positions",
+        )
+        branches.append(
+            LocalMaturationBranch(
+                branch_name=cell_to_str(bname),
+                phase_branch_id=slugify(f"{parent['candidate_id']}__{bname}"),
+                editable_positions=editable_positions,
+            )
+        )
+    if args.max_combinations is not None:
+        branches = branches[: int(args.max_combinations)]
+
+    target_per_branch = int(
+        phase_cfg.get(
+            "candidates_per_branch",
+            local_cfg.get("candidate_count_per_branch", 50),
+        )
+    )
+    if args.limit_per_combination is not None:
+        target_per_branch = min(target_per_branch, int(args.limit_per_combination))
+    if target_per_branch <= 0:
+        raise PipelineError("candidates_per_branch must be > 0 for phase_next_test1_local_maturation.")
+
+    aa_alphabet = re.sub(r"[^A-Z]", "", cell_to_str(local_cfg.get("aa_alphabet", "ACDEFGHIKLMNPQRSTVWY")).upper())
+    if not aa_alphabet:
+        aa_alphabet = "ACDEFGHIKLMNPQRSTVWY"
+    min_mutations = int(local_cfg.get("min_mutations_per_candidate", 1))
+    max_mutations_default = max(1, max(len(b.editable_positions) for b in branches))
+    max_mutations = int(local_cfg.get("max_mutations_per_candidate", max_mutations_default))
+
+    tooling = context["tool_cfg"]
+    pipeline_cfg = context["pipeline_cfg"]
+    rank_weights = pipeline_cfg.get("filters", {}).get("ranking_weights", {})
+    seed_base = int(pipeline_cfg.get("project", {}).get("random_seed", 20260316))
+    framework_parts = split_framework_and_cdr(context["nanobody_seq"], context["cdr"])
+
+    phase_name = "phase_next_test1_local_maturation"
+    phase_dir = root / phase_name
+    branches_dir = phase_dir / "branches"
+    logs_dir = root / "logs" / phase_name
+    ensure_dirs([phase_dir, branches_dir, logs_dir])
+
+    parent_structure = Path(parent["structure_pdb"])
+    if not args.dry_run and not parent_structure.exists():
+        raise PipelineError(
+            f"Resolved Test1 parent structure does not exist: {parent_structure}"
+        )
+
+    status_path = phase_dir / "phase_status.json"
+    manifest_path = phase_dir / "phase_manifest.csv"
+    status = read_status(status_path)
+    completed = set(status.get("completed_branches", [])) if args.resume else set()
+    manifest_rows: List[dict] = []
+
+    for branch in branches:
+        bdir = branches_dir / branch.phase_branch_id
+        ensure_dirs([bdir, bdir / "threaded", bdir / "rf2_metrics"])
+        candidates_csv = bdir / "candidates.csv"
+        candidates = load_or_empty_csv(candidates_csv)
+        existing_ids = {cell_to_str(x.get("candidate_id")) for x in candidates}
+        seen_sequences = {cell_to_str(x.get("full_sequence")) for x in candidates if cell_to_str(x.get("full_sequence"))}
+
+        if args.resume and branch.phase_branch_id in completed and len(candidates) >= target_per_branch:
+            manifest_rows.append(
+                {
+                    "branch_name": branch.branch_name,
+                    "phase_branch_id": branch.phase_branch_id,
+                    "status": "skipped_resume",
+                    "updated_at": now_str(),
+                }
+            )
+            continue
+
+        for i in range(1, target_per_branch + 1):
+            cid = f"{branch.phase_branch_id}_c{i:03d}"
+            if cid in existing_ids:
+                continue
+
+            final_seq = parent["full_sequence"]
+            edited_pos: List[int] = []
+            warning_parts: List[str] = []
+            duplicate_after_sampling = False
+            for attempt in range(1, 97):
+                rng = deterministic_rng(seed_base, f"{cid}::attempt{attempt}")
+                proposed_seq, proposed_edited = mutate_local_positions(
+                    parent_seq=parent["full_sequence"],
+                    editable_positions=branch.editable_positions,
+                    rng=rng,
+                    aa_alphabet=aa_alphabet,
+                    min_mutations=min_mutations,
+                    max_mutations=max_mutations,
+                )
+                constrained_seq, constrained_edited, mask_warning = enforce_cdr1_editable_positions(
+                    parent_full_seq=parent["full_sequence"],
+                    proposed_full_seq=proposed_seq,
+                    editable_positions=branch.editable_positions,
+                )
+                # Core Test1 primary-contact positions must remain unchanged.
+                core_violations = [
+                    p
+                    for p in fixed_core_positions
+                    if 1 <= p <= len(constrained_seq)
+                    and constrained_seq[p - 1] != parent["full_sequence"][p - 1]
+                ]
+                if core_violations:
+                    raise PipelineError(
+                        f"{cid} violates fixed core positions: {core_violations}"
+                    )
+                if constrained_seq in seen_sequences and attempt < 96:
+                    continue
+                duplicate_after_sampling = constrained_seq in seen_sequences
+                final_seq = constrained_seq
+                edited_pos = constrained_edited or proposed_edited
+                if mask_warning:
+                    warning_parts.append(mask_warning)
+                break
+
+            if duplicate_after_sampling:
+                warning_parts.append("Duplicate full sequence after resampling attempts.")
+            if edited_pos:
+                warning_parts.append(
+                    "Edited positions: " + ",".join(str(x) for x in sorted(set(edited_pos)))
+                )
+            seen_sequences.add(final_seq)
+
+            threaded_pdb = bdir / "threaded" / f"{cid}.pdb"
+            threading_warning = ""
+            if args.dry_run or not tooling.execute_real_tools:
+                threaded_pdb = parent_structure
+            else:
+                try:
+                    thread_sequence_on_backbone_pose(
+                        backbone_pdb=parent_structure,
+                        binder_sequence=final_seq,
+                        out_pdb=threaded_pdb,
+                        binder_chain=context["cdr"].chain_id or "H",
+                    )
+                except PipelineError as exc:
+                    msg = str(exc)
+                    if "Failed to import rfantibody.util.pose" in msg:
+                        threaded_pdb = parent_structure
+                        threading_warning = (
+                            "Pose-threading unavailable (rfantibody import failed); "
+                            "using parent backbone directly for RF2 input."
+                        )
+                    else:
+                        raise
+
+            rf2_json = bdir / "rf2_metrics" / f"{cid}_rf2.json"
+            metrics = run_rf2_filter(
+                cfg=tooling,
+                input_pdb=threaded_pdb,
+                sequence=final_seq,
+                out_json=rf2_json,
+                dry_run=args.dry_run,
+                log_file=logs_dir / f"{branch.phase_branch_id}_rf2.log",
+                seed=seed_base,
+                context={
+                    "candidate_id": cid,
+                    "campaign_name": parent.get("campaign_name", "test1_local_maturation"),
+                    "cdr3_contact_bias": 1,
+                },
+            )
+
+            heuristics = compute_interface_heuristics(
+                pdb_path=Path(str(metrics.get("rf2_best_pdb", threaded_pdb))),
+                parts=framework_parts,
+                h1_len=int(parent["h1_length"]),
+                h3_len=int(parent["h3_length"]),
+                hotspot_tokens=hotspot_set["tokens"],
+                cutoff=5.0,
+            )
+            metrics.update(heuristics)
+            if "structural_plausibility" not in metrics:
+                metrics["structural_plausibility"] = max(0.0, min(1.0, float(metrics.get("rf2_pred_lddt", 0.0))))
+            ranking_score = round(float(combine_weighted_score(metrics, rank_weights)), 6)
+
+            strict_pass, relaxed_pass = rescue_strict_relaxed_flags(
+                rf2_pae=_safe_float(metrics.get("rf2_pae"), 99.0),
+                rf2_rmsd=_safe_float(metrics.get("design_rf2_rmsd"), 99.0),
+                strict_cfg=strict_cfg,
+                relaxed_cfg=relaxed_cfg,
+            )
+
+            if threading_warning:
+                warning_parts.append(threading_warning)
+            warning = " | ".join(warning_parts)
+
+            candidates.append(
+                {
+                    "phase": phase_name,
+                    "branch_name": branch.branch_name,
+                    "phase_branch_id": branch.phase_branch_id,
+                    "parent_candidate_id": parent["candidate_id"],
+                    "parent_candidate_ref": parent_ref,
+                    "parent_alias_source": parent["alias_source"],
+                    "candidate_id": cid,
+                    "editable_positions": ",".join(str(x) for x in branch.editable_positions),
+                    "fixed_core_positions": ",".join(str(x) for x in fixed_core_positions),
+                    "hotspot_set_name": hotspot_set["set_name"],
+                    "hotspot_tokens": ",".join(hotspot_set["tokens"]),
+                    "full_sequence": final_seq,
+                    "strict_pass": int(strict_pass),
+                    "relaxed_pass": int(relaxed_pass),
+                    "rf2_pae": _safe_float(metrics.get("rf2_pae"), 99.0),
+                    "design_vs_rf2_rmsd": _safe_float(metrics.get("design_rf2_rmsd"), 99.0),
+                    "ranking_score": ranking_score,
+                    "threaded_pdb": str(threaded_pdb),
+                    "rf2_best_pdb": str(metrics.get("rf2_best_pdb", "")),
+                    "cdr1_edit_count": len(edited_pos),
+                    "cdr1_edited_positions": ",".join(str(x) for x in sorted(set(edited_pos))),
+                    "warning": warning,
+                }
+            )
+            existing_ids.add(cid)
+
+        branch_fields = [
+            "phase",
+            "branch_name",
+            "phase_branch_id",
+            "parent_candidate_id",
+            "parent_candidate_ref",
+            "parent_alias_source",
+            "candidate_id",
+            "editable_positions",
+            "fixed_core_positions",
+            "hotspot_set_name",
+            "hotspot_tokens",
+            "full_sequence",
+            "strict_pass",
+            "relaxed_pass",
+            "rf2_pae",
+            "design_vs_rf2_rmsd",
+            "ranking_score",
+            "threaded_pdb",
+            "rf2_best_pdb",
+            "cdr1_edit_count",
+            "cdr1_edited_positions",
+            "warning",
+        ]
+        write_rows(candidates_csv, candidates, branch_fields)
+
+        branch_complete = len(candidates) >= target_per_branch
+        if branch_complete:
+            completed.add(branch.phase_branch_id)
+        manifest_rows.append(
+            {
+                "branch_name": branch.branch_name,
+                "phase_branch_id": branch.phase_branch_id,
+                "status": "completed" if branch_complete else "partial",
+                "updated_at": now_str(),
+            }
+        )
+        write_status(
+            status_path,
+            {
+                "phase": phase_name,
+                "updated_at": now_str(),
+                "resolved_test1_parent_candidate_id": parent["candidate_id"],
+                "completed_branches": sorted(completed),
+            },
+        )
+
+    atomic_write_csv(
+        manifest_path,
+        manifest_rows,
+        ["branch_name", "phase_branch_id", "status", "updated_at"],
+    )
+
+    all_rows: List[dict] = []
+    for branch in branches:
+        cfile = branches_dir / branch.phase_branch_id / "candidates.csv"
+        if cfile.exists():
+            all_rows.extend(pd.read_csv(cfile).to_dict(orient="records"))
+    if not all_rows:
+        raise PipelineError("phase_next_test1_local_maturation generated no candidate rows.")
+
+    df = pd.DataFrame(all_rows)
+    for col in ("strict_pass", "relaxed_pass"):
+        df[col] = df[col].astype(int)
+    for col in ("rf2_pae", "design_vs_rf2_rmsd", "ranking_score"):
+        df[col] = df[col].astype(float)
+    dup = df["full_sequence"].astype(str).duplicated(keep=False)
+    df["unique_sequence_flag"] = (~dup).astype(int)
+    df = df.sort_values(["branch_name", "rf2_pae", "design_vs_rf2_rmsd", "candidate_id"], ascending=[True, True, True, True])
+
+    summary_csv = root / "results/summaries/phase_next_test1_local_maturation_rf2_summary.csv"
+    strict_csv = root / "results/summaries/phase_next_test1_local_maturation_strict_pass.csv"
+    strict_fasta = root / "results/summaries/phase_next_test1_local_maturation_strict_pass.fasta"
+    summary_md = root / "results/summaries/phase_next_test1_local_maturation_summary.md"
+
+    summary_fields = [
+        "branch_name",
+        "parent_candidate_id",
+        "candidate_id",
+        "editable_positions",
+        "hotspot_set_name",
+        "rf2_pae",
+        "design_vs_rf2_rmsd",
+        "ranking_score",
+        "strict_pass",
+        "relaxed_pass",
+        "full_sequence",
+        "unique_sequence_flag",
+        "phase_branch_id",
+        "hotspot_tokens",
+        "cdr1_edit_count",
+        "cdr1_edited_positions",
+        "threaded_pdb",
+        "rf2_best_pdb",
+        "warning",
+    ]
+    atomic_write_csv(summary_csv, df.to_dict(orient="records"), summary_fields)
+
+    strict_df = df[df["strict_pass"] == 1].copy()
+    strict_df = strict_df.sort_values(["branch_name", "rf2_pae", "design_vs_rf2_rmsd", "candidate_id"], ascending=[True, True, True, True])
+    strict_fields = [
+        "branch_name",
+        "parent_candidate_id",
+        "candidate_id",
+        "rf2_pae",
+        "design_vs_rf2_rmsd",
+        "ranking_score",
+        "full_sequence",
+        "unique_sequence_flag",
+        "editable_positions",
+        "hotspot_set_name",
+    ]
+    atomic_write_csv(strict_csv, strict_df.to_dict(orient="records"), strict_fields)
+
+    strict_unique = strict_df.drop_duplicates(subset=["full_sequence"], keep="first")
+    strict_fasta.parent.mkdir(parents=True, exist_ok=True)
+    with strict_fasta.open("w", encoding="utf-8") as handle:
+        for _, row in strict_unique.iterrows():
+            handle.write(f">{row['candidate_id']}\n{row['full_sequence']}\n")
+
+    branch_lines: List[str] = [SAFETY_ETHICS_STATEMENT, "", "# Test1 Local Maturation (RF2-Only)", ""]
+    branch_lines.append(f"- Resolved Test1 parent candidate ID: `{parent['candidate_id']}`")
+    branch_lines.append(f"- Test1 resolution source: `{parent['alias_source']}`")
+    branch_lines.append(f"- Shared hotspot set: `{hotspot_set['set_name']}` ({', '.join(hotspot_set['tokens'])})")
+    branch_lines.append("")
+
+    branch_scores: Dict[str, dict] = {}
+    top_n = int(local_cfg.get("top_n_per_branch_for_summary", 3))
+    for branch in branches:
+        bdf = df[df["branch_name"] == branch.branch_name].copy()
+        total = int(bdf.shape[0])
+        strict_count = int(bdf["strict_pass"].sum()) if total else 0
+        relaxed_count = int(bdf["relaxed_pass"].sum()) if total else 0
+        strict_rate = strict_count / max(1, total)
+        relaxed_rate = relaxed_count / max(1, total)
+        bdf["rf2_quality"] = bdf["rf2_pae"] + bdf["design_vs_rf2_rmsd"]
+        bbest = bdf.sort_values(["rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"]).head(1)
+        btop = bdf.sort_values(["rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"]).head(max(1, top_n))
+        top3_quality = float(btop["rf2_quality"].mean()) if not btop.empty else 999.0
+        top1_quality = float(bbest.iloc[0]["rf2_quality"]) if not bbest.empty else 999.0
+        strict_unique_count = int(bdf[(bdf["strict_pass"] == 1) & (bdf["unique_sequence_flag"] == 1)].shape[0])
+        promising = (strict_count >= 5) or (strict_rate >= 0.10 and top1_quality < 10.0)
+        branch_scores[branch.branch_name] = {
+            "strict_count": strict_count,
+            "relaxed_count": relaxed_count,
+            "top1_quality": top1_quality,
+            "top3_quality": top3_quality,
+            "strict_unique_count": strict_unique_count,
+            "promising": promising,
+        }
+
+        branch_lines.append(f"## {branch.branch_name}")
+        branch_lines.append(f"- Total candidates: {total}")
+        branch_lines.append(f"- Strict pass: {strict_count}/{total} ({strict_rate:.1%})")
+        branch_lines.append(f"- Relaxed pass: {relaxed_count}/{total} ({relaxed_rate:.1%})")
+        if not bbest.empty:
+            row = bbest.iloc[0]
+            branch_lines.append(
+                f"- Best RF2 candidate: `{row['candidate_id']}` "
+                f"(pAE={float(row['rf2_pae']):.3f}, RMSD={float(row['design_vs_rf2_rmsd']):.3f})"
+            )
+        branch_lines.append("- Top 3 RF2 candidates:")
+        for _, row in btop.iterrows():
+            branch_lines.append(
+                f"  - `{row['candidate_id']}` "
+                f"(pAE={float(row['rf2_pae']):.3f}, RMSD={float(row['design_vs_rf2_rmsd']):.3f}, "
+                f"quality={float(row['rf2_quality']):.3f})"
+            )
+        branch_lines.append(f"- Promising for expansion: {'yes' if promising else 'no'}")
+        branch_lines.append("")
+
+    branch_lines.append("## Branch Comparison")
+    compare_rows = []
+    for bname, info in branch_scores.items():
+        compare_rows.append(
+            (
+                bname,
+                int(info["strict_count"]),
+                int(info["relaxed_count"]),
+                float(info["top1_quality"]),
+                float(info["top3_quality"]),
+                int(info["strict_unique_count"]),
+            )
+        )
+    compare_rows = sorted(compare_rows, key=lambda x: (x[1], x[2], -x[3], -x[4], x[5]), reverse=True)
+    for bname, strict_count, relaxed_count, top1_q, top3_q, strict_unique_count in compare_rows:
+        branch_lines.append(
+            f"- {bname}: strict={strict_count}, relaxed={relaxed_count}, "
+            f"top1_quality={top1_q:.3f}, top3_quality={top3_q:.3f}, "
+            f"strict_unique_sequences={strict_unique_count}"
+        )
+    if compare_rows:
+        branch_lines.append(
+            f"- Most promising branch for next AF3/web evaluation and later expansion: **{compare_rows[0][0]}**"
+        )
+
+    summary_md.write_text("\n".join(branch_lines) + "\n", encoding="utf-8")
+
 def run_phase_design(
     phase_name: str,
     combinations: List[Combination],
@@ -2963,6 +3794,10 @@ def write_project_summary(context: dict):
         ("phase4_h2_refine", root / "results/summaries/phase4_h2_refine_summary.csv"),
         ("phase5_cdr1_rescue_pilot", root / "results/summaries/phase5_cdr1_rescue_pilot_summary.csv"),
         ("phase6_cdr1_rescue_main", root / "results/summaries/phase6_cdr1_rescue_main_summary.csv"),
+        (
+            "phase_next_test1_local_maturation",
+            root / "results/summaries/phase_next_test1_local_maturation_rf2_summary.csv",
+        ),
     ]
 
     lines = [SAFETY_ETHICS_STATEMENT, "", "# Pipeline Summary", ""]
@@ -3024,6 +3859,8 @@ def run_single_phase(phase_name: str, context: dict, args: argparse.Namespace):
         run_phase5_cdr1_rescue_pilot(context=context, args=args)
     elif phase_name == "phase6_cdr1_rescue_main":
         run_phase6_cdr1_rescue_main(context=context, args=args)
+    elif phase_name == "phase_next_test1_local_maturation":
+        run_phase_next_test1_local_maturation(context=context, args=args)
     else:
         raise PipelineError(f"Unsupported phase: {phase_name}")
 
@@ -3082,6 +3919,7 @@ def main() -> int:
         "phase4_h2_refine",
         "phase5_cdr1_rescue_pilot",
         "phase6_cdr1_rescue_main",
+        "phase_next_test1_local_maturation",
     ]
 
     if args.phase == "all":

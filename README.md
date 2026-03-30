@@ -34,6 +34,7 @@ Not included by design:
 ├── phase4_h2_refine/
 ├── phase5_cdr1_rescue_pilot/
 ├── phase6_cdr1_rescue_main/
+├── phase_next_test1_local_maturation/
 ├── results/
 │   ├── summaries/
 │   ├── rf2_passed/
@@ -376,6 +377,49 @@ python scripts/summarize_cdr1_rescue.py
 Rescue Final Top25 AF3 handoff output directory:
 
 - `results/af3_web_exports_cdr1_rescue/`
+
+## Test1 Local Maturation (Incremental Next Step)
+
+This repository now also includes a **Test1-centered local maturation** stage for incremental follow-up.
+
+- Parent:
+  - resolved from `Test1` alias to real candidate ID using existing project summaries
+- Branches:
+  - `Branch_A_H1_edge_only` editable positions: `H1:25, H1:26, H1:31, H1:32`
+  - `Branch_B_H1_plus_FR_support` editable positions: `H1:25, H1:26, H1:31, H1:32, FR:35, FR:36, FR:37, FR:39`
+- Fixed residues / scope:
+  - core H1 residues `27/28/29/30/33/34` fixed
+  - H2 fixed, H3 fixed
+  - fixed-backbone local sequence maturation (no broad de novo loop search)
+- Shared hotspot set:
+  - `B75, B217, B219, C122, C124`
+- Evaluation:
+  - RF2-only strict/relaxed filtering
+  - no local AF3 execution (manual AF3 web evaluation later)
+
+Config files:
+
+- `data/configs/test1_local_maturation_phase.yaml`
+- `data/configs/test1_local_maturation_hotspots.yaml`
+
+Run command:
+
+```bash
+python scripts/run_pipeline.py --phase phase_next_test1_local_maturation --execute --resume
+```
+
+Convenience script:
+
+```bash
+bash scripts/run_phase_next_test1_local_maturation.sh --execute --resume
+```
+
+Generated outputs:
+
+- `results/summaries/phase_next_test1_local_maturation_rf2_summary.csv`
+- `results/summaries/phase_next_test1_local_maturation_strict_pass.csv`
+- `results/summaries/phase_next_test1_local_maturation_strict_pass.fasta`
+- `results/summaries/phase_next_test1_local_maturation_summary.md`
 
 ## Filtering and ranking defaults
 

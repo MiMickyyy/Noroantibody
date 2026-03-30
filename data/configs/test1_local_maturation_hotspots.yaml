@@ -1,0 +1,4 @@
+test1_local_maturation_hotspot_sets:
+  Test1_defect_guided:
+    description: "Defect-guided local maturation hotspot set derived from Test1 AF3 interface analysis"
+    tokens: ["B75", "B217", "B219", "C122", "C124"]
