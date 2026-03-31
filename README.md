@@ -35,6 +35,7 @@ Not included by design:
 ├── phase5_cdr1_rescue_pilot/
 ├── phase6_cdr1_rescue_main/
 ├── phase_next_test1_local_maturation/
+├── phase_next_champion_narrow50/
 ├── results/
 │   ├── summaries/
 │   ├── rf2_passed/
@@ -420,6 +421,49 @@ Generated outputs:
 - `results/summaries/phase_next_test1_local_maturation_strict_pass.csv`
 - `results/summaries/phase_next_test1_local_maturation_strict_pass.fasta`
 - `results/summaries/phase_next_test1_local_maturation_summary.md`
+
+## Champion Narrow50 Local Maturation (Phase8 Incremental Follow-up)
+
+This repository also includes a **single-line champion-consensus narrowed local maturation** stage:
+
+- Parent:
+  - auto-resolved from Phase7 AF3 ranked summary (`strict 5/5` subset, then ranked by AF3 quality columns)
+  - real parent candidate ID is recorded in outputs/status
+- Scope:
+  - one narrowed line, total `50` candidates (no branching)
+  - fixed-backbone local sequence maturation + RF2 filtering only
+  - no local AF3 execution
+- Fixed positions:
+  - `H1:27, H1:28, H1:29, H1:30, H1:33, H1:34`
+  - H2 fixed, H3 fixed
+- Editable positions:
+  - `H1:25, H1:26, H1:31, FR:37, FR:39`
+- Shared hotspot patch:
+  - `B217, B218, B219, C121, C122, C124`
+
+Config files:
+
+- `data/configs/champion_narrow50_phase.yaml`
+- `data/configs/champion_narrow50_hotspots.yaml`
+
+Run command:
+
+```bash
+python scripts/run_pipeline.py --phase phase_next_champion_narrow50 --execute --resume
+```
+
+Convenience script:
+
+```bash
+bash scripts/run_phase_next_champion_narrow50.sh --execute --resume
+```
+
+Generated outputs:
+
+- `results/summaries/phase_next_champion_narrow50_rf2_summary.csv`
+- `results/summaries/phase_next_champion_narrow50_strict_pass.csv`
+- `results/summaries/phase_next_champion_narrow50_strict_pass.fasta`
+- `results/summaries/phase_next_champion_narrow50_summary.md`
 
 ## Filtering and ranking defaults
 

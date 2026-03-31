@@ -44,3 +44,7 @@ phases:
     description: "Test1-centered local maturation (Branch A/B, fixed-backbone local sequence redesign, RF2-only)"
     input_from_phase: phase6_cdr1_rescue_main
     candidates_per_branch: 50
+  phase_next_champion_narrow50:
+    description: "Champion-consensus narrowed local maturation (single line, 50 candidates, RF2-only)"
+    input_from_phase: phase_next_test1_local_maturation
+    candidates_total: 50

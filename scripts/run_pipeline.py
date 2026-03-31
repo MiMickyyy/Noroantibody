@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -189,6 +190,7 @@ def parse_args() -> argparse.Namespace:
             "phase5_cdr1_rescue_pilot",
             "phase6_cdr1_rescue_main",
             "phase_next_test1_local_maturation",
+            "phase_next_champion_narrow50",
             "all",
         ],
     )
@@ -209,6 +211,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test1-local-maturation-hotspots",
         default="data/configs/test1_local_maturation_hotspots.yaml",
+    )
+    parser.add_argument(
+        "--champion-narrow50-config",
+        default="data/configs/champion_narrow50_phase.yaml",
+    )
+    parser.add_argument(
+        "--champion-narrow50-hotspots",
+        default="data/configs/champion_narrow50_hotspots.yaml",
     )
     parser.add_argument(
         "--phase2-selection-config",
@@ -316,6 +326,14 @@ def load_base_context(args: argparse.Namespace) -> dict:
     test1_local_hotspots = (
         read_yaml(test1_local_hotspot_path) if test1_local_hotspot_path.exists() else {}
     )
+    champion_narrow_cfg_path = root / args.champion_narrow50_config
+    champion_narrow_hotspot_path = root / args.champion_narrow50_hotspots
+    champion_narrow_cfg = (
+        read_yaml(champion_narrow_cfg_path) if champion_narrow_cfg_path.exists() else {}
+    )
+    champion_narrow_hotspots = (
+        read_yaml(champion_narrow_hotspot_path) if champion_narrow_hotspot_path.exists() else {}
+    )
 
     # Normalize known path-like fields to absolute paths for robust execution
     for key in (
@@ -400,6 +418,10 @@ def load_base_context(args: argparse.Namespace) -> dict:
         "test1_local_hotspot_path": str(test1_local_hotspot_path),
         "test1_local_cfg": test1_local_cfg,
         "test1_local_hotspots": test1_local_hotspots,
+        "champion_narrow_cfg_path": str(champion_narrow_cfg_path),
+        "champion_narrow_hotspot_path": str(champion_narrow_hotspot_path),
+        "champion_narrow_cfg": champion_narrow_cfg,
+        "champion_narrow_hotspots": champion_narrow_hotspots,
     }
 
 
@@ -1015,7 +1037,7 @@ def _parse_h1_h3_from_combo_id(combination_id: str) -> Tuple[Optional[int], Opti
     token = str(combination_id or "").strip()
     if not token:
         return None, None
-    m = re.search(r"_H1(\d+)_H3(\d+)$", token)
+    m = re.search(r"_H1(\d+)_H3(\d+)(?:_|$)", token)
     if not m:
         return None, None
     return int(m.group(1)), int(m.group(2))
@@ -2117,14 +2139,19 @@ def parse_position_list(values: Sequence[object], field_name: str) -> List[int]:
     return uniq
 
 
-def build_test1_local_hotspot_set(hotspot_cfg: dict, set_name: str) -> Dict[str, object]:
-    sets = hotspot_cfg.get("test1_local_maturation_hotspot_sets", {})
+def _build_named_hotspot_set(
+    hotspot_cfg: dict,
+    root_key: str,
+    set_name: str,
+    cfg_hint: str,
+) -> Dict[str, object]:
+    sets = hotspot_cfg.get(root_key, {})
     if not sets:
         raise PipelineError(
-            "Missing test1_local_maturation_hotspot_sets in data/configs/test1_local_maturation_hotspots.yaml"
+            f"Missing {root_key} in {cfg_hint}"
         )
     if set_name not in sets:
-        raise PipelineError(f"Unknown test1 local maturation hotspot set: {set_name}")
+        raise PipelineError(f"Unknown hotspot set '{set_name}' in {cfg_hint}")
     node = sets[set_name] or {}
     tokens = [cell_to_str(x) for x in node.get("tokens", []) if cell_to_str(x)]
     if not tokens:
@@ -2144,6 +2171,24 @@ def build_test1_local_hotspot_set(hotspot_cfg: dict, set_name: str) -> Dict[str,
     }
 
 
+def build_test1_local_hotspot_set(hotspot_cfg: dict, set_name: str) -> Dict[str, object]:
+    return _build_named_hotspot_set(
+        hotspot_cfg=hotspot_cfg,
+        root_key="test1_local_maturation_hotspot_sets",
+        set_name=set_name,
+        cfg_hint="data/configs/test1_local_maturation_hotspots.yaml",
+    )
+
+
+def build_champion_narrow50_hotspot_set(hotspot_cfg: dict, set_name: str) -> Dict[str, object]:
+    return _build_named_hotspot_set(
+        hotspot_cfg=hotspot_cfg,
+        root_key="champion_narrow50_hotspot_sets",
+        set_name=set_name,
+        cfg_hint="data/configs/champion_narrow50_hotspots.yaml",
+    )
+
+
 def _candidate_index_for_local_maturation(root: Path) -> Dict[str, Dict[str, object]]:
     index = _candidate_index_for_rescue(root)
     source_csvs = [
@@ -2151,6 +2196,8 @@ def _candidate_index_for_local_maturation(root: Path) -> Dict[str, Dict[str, obj
         root / "results/summaries/final_30_cdr1_rescue_candidates_table.csv",
         root / "results/summaries/final25_cdr1_rescue_candidates.csv",
         root / "results/summaries/final_25_cdr1_rescue_candidates_table.csv",
+        root / "results/summaries/phase_next_test1_local_maturation_rf2_summary.csv",
+        root / "results/summaries/phase_next_test1_local_maturation_strict_pass.csv",
     ]
     for cpath in source_csvs:
         if not cpath.exists():
@@ -2169,6 +2216,18 @@ def _candidate_index_for_local_maturation(root: Path) -> Dict[str, Dict[str, obj
         if not cond_root.exists():
             continue
         for cfile in cond_root.glob("*/candidates.csv"):
+            try:
+                rows = pd.read_csv(cfile).to_dict(orient="records")
+            except Exception:
+                continue
+            for row in rows:
+                cid = cell_to_str(row.get("candidate_id"))
+                if cid and cid not in index:
+                    index[cid] = _normalize_candidate_row(root=root, row=row)
+
+    next_root = root / "phase_next_test1_local_maturation" / "branches"
+    if next_root.exists():
+        for cfile in next_root.glob("*/candidates.csv"):
             try:
                 rows = pd.read_csv(cfile).to_dict(orient="records")
             except Exception:
@@ -2394,8 +2453,221 @@ def resolve_test1_parent_candidate(context: dict, parent_ref: str, local_cfg: di
         "structure_pdb": parent_structure,
         "combination_id": cell_to_str(row.get("combination_id") or row.get("parent_combination_id")),
         "campaign_name": cell_to_str(row.get("campaign_name") or row.get("parent_campaign_name")),
+        "rf2_pae": _safe_float(row.get("rf2_pae"), float("nan")),
+        "design_vs_rf2_rmsd": _safe_float(
+            row.get("design_vs_rf2_rmsd", row.get("design_rf2_rmsd")),
+            float("nan"),
+        ),
+        "ranking_score": _safe_float(row.get("ranking_score"), float("nan")),
     }
     return out
+
+
+def _looks_like_stage7_short_job_id(token: str) -> bool:
+    return bool(re.fullmatch(r"spg\d+_\d+", str(token or "").strip().lower()))
+
+
+def _read_af3_job_request_sequence(job_dir: Path) -> str:
+    jfiles = sorted(job_dir.glob("*_job_request.json"))
+    if not jfiles:
+        return ""
+    try:
+        obj = read_json(jfiles[0], default={})
+        if isinstance(obj, list):
+            obj = obj[0] if obj else {}
+        seq = (
+            ((obj.get("sequences") or [])[0] or {})
+            .get("proteinChain", {})
+            .get("sequence", "")
+        )
+        return _normalize_parent_sequence(seq, f"{jfiles[0].name}:sequences[0]", job_dir.name)
+    except Exception:
+        return ""
+
+
+def _iter_stage7_job_map_csvs(root: Path, local_cfg: dict) -> List[Path]:
+    candidates: List[Path] = []
+    explicit = resolve_path_like(root, cell_to_str(local_cfg.get("stage7_job_map_csv", "")))
+    if explicit is not None and explicit.exists():
+        candidates.append(explicit)
+
+    glob_patterns = [
+        "results/af3_web_exports_strict_pass*/af3_strict_pass_all_map.csv",
+        "results/af3_web_exports_strict_pass*/af3_strict_pass_group*_map.csv",
+    ]
+    for pattern in glob_patterns:
+        for p in root.glob(pattern):
+            if p.exists():
+                candidates.append(p.resolve())
+
+    for p in root.rglob("af3_strict_pass_all_map.csv"):
+        if p.exists():
+            candidates.append(p.resolve())
+    for p in root.rglob("af3_strict_pass_group*_map.csv"):
+        if p.exists():
+            candidates.append(p.resolve())
+
+    uniq: Dict[str, Path] = {}
+    for p in candidates:
+        uniq[str(p)] = p
+    return sorted(uniq.values(), key=lambda x: x.stat().st_mtime, reverse=True)
+
+
+def _find_stage7_job_dir(stage7_dir: Path, job_name: str) -> Optional[Path]:
+    direct = stage7_dir / job_name
+    if direct.exists() and direct.is_dir():
+        return direct
+    for d in stage7_dir.iterdir():
+        if not d.is_dir():
+            continue
+        jfiles = sorted(d.glob("*_job_request.json"))
+        if not jfiles:
+            continue
+        try:
+            obj = read_json(jfiles[0], default={})
+            if isinstance(obj, list):
+                obj = obj[0] if obj else {}
+            if cell_to_str(obj.get("name")) == job_name:
+                return d
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_stage7_job_to_candidate_id(
+    root: Path,
+    local_cfg: dict,
+    job_name: str,
+    raw_candidate_id: str,
+    stage7_job_dir: Optional[Path],
+) -> Tuple[str, str]:
+    raw = cell_to_str(raw_candidate_id)
+    if raw and not _looks_like_stage7_short_job_id(raw):
+        return raw, "stage7_ranked_summary.candidate_id"
+
+    for mpath in _iter_stage7_job_map_csvs(root, local_cfg):
+        try:
+            df = pd.read_csv(mpath)
+        except Exception:
+            continue
+        if "job_name" not in df.columns or "candidate_id" not in df.columns:
+            continue
+        q = df[df["job_name"].astype(str) == job_name]
+        if q.empty:
+            continue
+        cid = cell_to_str(q.iloc[0].get("candidate_id"))
+        if cid:
+            return cid, str(mpath)
+
+    # Sequence-based fallback mapping: AF3 job seq -> any known candidate with same full sequence.
+    stage7_seq = _read_af3_job_request_sequence(stage7_job_dir) if stage7_job_dir is not None else ""
+    if stage7_seq:
+        index = _candidate_index_for_local_maturation(root)
+        for cid, row in index.items():
+            try:
+                seq = _normalize_parent_sequence(
+                    cell_to_str(row.get("full_sequence")),
+                    f"candidate_index[{cid}]",
+                    cid,
+                )
+            except Exception:
+                continue
+            if seq and seq == stage7_seq:
+                return cid, "sequence_match_candidate_index"
+
+    fallback = raw or job_name
+    return fallback, "fallback_stage7_job_name"
+
+
+def resolve_best_phase7_parent_candidate(context: dict, local_cfg: dict) -> dict:
+    root = context["root"]
+    ranked_path = resolve_path_like(
+        root,
+        cell_to_str(local_cfg.get("phase7_ranked_summary_csv", "results/summaries/af3_stage7_ranked_summary_with_wt_test1.csv")),
+    )
+    if ranked_path is None or not ranked_path.exists():
+        raise PipelineError(
+            "Missing Phase7 AF3 ranked summary for parent resolution. "
+            "Set champion_narrow50.phase7_ranked_summary_csv to a valid file."
+        )
+    stage7_dir = resolve_path_like(
+        root,
+        cell_to_str(local_cfg.get("phase7_af3_results_dir", "AF3 Results/Stage7 AF3")),
+    )
+    if stage7_dir is None or not stage7_dir.exists():
+        raise PipelineError(
+            "Missing Stage7 AF3 directory for champion parent resolution. "
+            "Set champion_narrow50.phase7_af3_results_dir to a valid directory."
+        )
+
+    df = pd.read_csv(ranked_path)
+    if "source_group" in df.columns:
+        df = df[df["source_group"].astype(str) == "Stage7"].copy()
+    if "strict_pass_models" in df.columns and "n_models" in df.columns:
+        strict = df[
+            (df["n_models"].fillna(0).astype(int) > 0)
+            & (df["strict_pass_models"].fillna(0).astype(int) == df["n_models"].fillna(0).astype(int))
+        ].copy()
+        if not strict.empty:
+            df = strict
+    if df.empty:
+        raise PipelineError(
+            f"No Stage7 rows available in ranked summary: {ranked_path}"
+        )
+
+    sort_cols = []
+    sort_asc = []
+    for col, asc in [
+        ("interface_stability_score", False),
+        ("best_pair_iptm_mean", False),
+        ("best_pair_pae_min_mean", True),
+    ]:
+        if col in df.columns:
+            sort_cols.append(col)
+            sort_asc.append(asc)
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=sort_asc)
+    best = df.iloc[0].to_dict()
+    best_job = cell_to_str(best.get("job_name"))
+    if not best_job:
+        raise PipelineError(f"Top Stage7 row in {ranked_path} has empty job_name.")
+
+    stage7_job_dir = _find_stage7_job_dir(stage7_dir, best_job)
+    resolved_parent_ref, parent_ref_source = _resolve_stage7_job_to_candidate_id(
+        root=root,
+        local_cfg=local_cfg,
+        job_name=best_job,
+        raw_candidate_id=cell_to_str(best.get("candidate_id")),
+        stage7_job_dir=stage7_job_dir,
+    )
+
+    parent = resolve_test1_parent_candidate(
+        context=context,
+        parent_ref=resolved_parent_ref,
+        local_cfg=local_cfg,
+    )
+    parent["alias_source"] = (
+        f"{parent.get('alias_source', '')} + phase7_best({best_job}) + {parent_ref_source}"
+    ).strip(" +")
+    parent["resolved_phase7_job_name"] = best_job
+    parent["resolved_phase7_parent_ref"] = resolved_parent_ref
+    parent["phase7_interface_stability_score"] = _safe_float(
+        best.get("interface_stability_score"),
+        float("nan"),
+    )
+    parent["phase7_best_pair_iptm_mean"] = _safe_float(
+        best.get("best_pair_iptm_mean"),
+        float("nan"),
+    )
+    parent["phase7_best_pair_pae_min_mean"] = _safe_float(
+        best.get("best_pair_pae_min_mean"),
+        float("nan"),
+    )
+    parent["phase7_strict_pass_models"] = parse_int_maybe(best.get("strict_pass_models"), 0)
+    parent["phase7_n_models"] = parse_int_maybe(best.get("n_models"), 0)
+    if stage7_job_dir is not None:
+        parent["phase7_job_dir"] = str(stage7_job_dir)
+    return parent
 
 
 def mutate_local_positions(
@@ -2895,6 +3167,418 @@ def run_phase_next_test1_local_maturation(context: dict, args: argparse.Namespac
         )
 
     summary_md.write_text("\n".join(branch_lines) + "\n", encoding="utf-8")
+
+
+def run_phase_next_champion_narrow50(context: dict, args: argparse.Namespace):
+    root = context["root"]
+    phases = context["phases_cfg"].get("phases", {})
+    phase_cfg = phases.get("phase_next_champion_narrow50", {})
+    local_cfg_root = context.get("champion_narrow_cfg", {}) or {}
+    hotspot_cfg_root = context.get("champion_narrow_hotspots", {}) or {}
+    if not local_cfg_root:
+        raise PipelineError(
+            "Missing narrowed champion config. Expected: data/configs/champion_narrow50_phase.yaml"
+        )
+    if not hotspot_cfg_root:
+        raise PipelineError(
+            "Missing narrowed champion hotspot config. Expected: data/configs/champion_narrow50_hotspots.yaml"
+        )
+
+    local_cfg = local_cfg_root.get("champion_narrow50", {})
+    if not local_cfg:
+        raise PipelineError("Missing 'champion_narrow50' block in narrowed champion config.")
+
+    parent = resolve_best_phase7_parent_candidate(context=context, local_cfg=local_cfg)
+    hotspot_set_name = cell_to_str(local_cfg.get("hotspot_set_name", "Champion_consensus_narrow_patch"))
+    hotspot_set = build_champion_narrow50_hotspot_set(hotspot_cfg_root, set_name=hotspot_set_name)
+
+    strict_cfg = local_cfg.get("strict_thresholds", {"rf2_pae_max": 10.0, "design_rf2_rmsd_max": 2.0})
+    relaxed_cfg = local_cfg.get("relaxed_thresholds", {"rf2_pae_max": 12.0, "design_rf2_rmsd_max": 2.5})
+    fixed_core_positions = parse_position_list(
+        local_cfg.get("fixed_core_positions", [27, 28, 29, 30, 33, 34]),
+        "champion_narrow50.fixed_core_positions",
+    )
+    editable_positions = parse_position_list(
+        local_cfg.get("editable_positions", [25, 26, 31, 37, 39]),
+        "champion_narrow50.editable_positions",
+    )
+    branch_name = cell_to_str(local_cfg.get("line_name", "Champion_Narrow50"))
+
+    target_total = int(
+        phase_cfg.get(
+            "candidates_total",
+            local_cfg.get("candidates_total", 50),
+        )
+    )
+    if args.limit_per_combination is not None:
+        target_total = min(target_total, int(args.limit_per_combination))
+    if target_total <= 0:
+        raise PipelineError("phase_next_champion_narrow50 candidates_total must be > 0.")
+
+    aa_alphabet = re.sub(
+        r"[^A-Z]",
+        "",
+        cell_to_str(local_cfg.get("aa_alphabet", "ACDEFGHIKLMNPQRSTVWY")).upper(),
+    )
+    if not aa_alphabet:
+        aa_alphabet = "ACDEFGHIKLMNPQRSTVWY"
+    min_mutations = int(local_cfg.get("min_mutations_per_candidate", 1))
+    max_mutations = int(local_cfg.get("max_mutations_per_candidate", max(1, len(editable_positions))))
+
+    tooling = context["tool_cfg"]
+    pipeline_cfg = context["pipeline_cfg"]
+    rank_weights = pipeline_cfg.get("filters", {}).get("ranking_weights", {})
+    seed_base = int(pipeline_cfg.get("project", {}).get("random_seed", 20260316))
+    framework_parts = split_framework_and_cdr(context["nanobody_seq"], context["cdr"])
+
+    phase_name = "phase_next_champion_narrow50"
+    phase_dir = root / phase_name
+    line_id = slugify(f"{parent['candidate_id']}__champion_narrow50")
+    line_dir = phase_dir / "line" / line_id
+    logs_dir = root / "logs" / phase_name
+    ensure_dirs([phase_dir, line_dir, line_dir / "threaded", line_dir / "rf2_metrics", logs_dir])
+
+    status_path = phase_dir / "phase_status.json"
+    candidates_csv = line_dir / "candidates.csv"
+    candidates = load_or_empty_csv(candidates_csv)
+    existing_ids = {cell_to_str(x.get("candidate_id")) for x in candidates}
+    seen_sequences = {cell_to_str(x.get("full_sequence")) for x in candidates if cell_to_str(x.get("full_sequence"))}
+
+    parent_structure = Path(parent["structure_pdb"])
+    if not args.dry_run and not parent_structure.exists():
+        raise PipelineError(
+            f"Resolved champion parent structure does not exist: {parent_structure}"
+        )
+
+    for i in range(1, target_total + 1):
+        cid = f"{line_id}_c{i:03d}"
+        if cid in existing_ids:
+            continue
+
+        final_seq = parent["full_sequence"]
+        edited_pos: List[int] = []
+        warning_parts: List[str] = []
+        duplicate_after_sampling = False
+        for attempt in range(1, 97):
+            rng = deterministic_rng(seed_base, f"{cid}::attempt{attempt}")
+            proposed_seq, proposed_edited = mutate_local_positions(
+                parent_seq=parent["full_sequence"],
+                editable_positions=editable_positions,
+                rng=rng,
+                aa_alphabet=aa_alphabet,
+                min_mutations=min_mutations,
+                max_mutations=max_mutations,
+            )
+            constrained_seq, constrained_edited, mask_warning = enforce_cdr1_editable_positions(
+                parent_full_seq=parent["full_sequence"],
+                proposed_full_seq=proposed_seq,
+                editable_positions=editable_positions,
+            )
+            core_violations = [
+                p
+                for p in fixed_core_positions
+                if 1 <= p <= len(constrained_seq)
+                and constrained_seq[p - 1] != parent["full_sequence"][p - 1]
+            ]
+            if core_violations:
+                raise PipelineError(
+                    f"{cid} violates fixed core positions: {core_violations}"
+                )
+            if constrained_seq in seen_sequences and attempt < 96:
+                continue
+            duplicate_after_sampling = constrained_seq in seen_sequences
+            final_seq = constrained_seq
+            edited_pos = constrained_edited or proposed_edited
+            if mask_warning:
+                warning_parts.append(mask_warning)
+            break
+
+        if duplicate_after_sampling:
+            warning_parts.append("Duplicate full sequence after resampling attempts.")
+        if edited_pos:
+            warning_parts.append(
+                "Edited positions: " + ",".join(str(x) for x in sorted(set(edited_pos)))
+            )
+        seen_sequences.add(final_seq)
+
+        threaded_pdb = line_dir / "threaded" / f"{cid}.pdb"
+        threading_warning = ""
+        if args.dry_run or not tooling.execute_real_tools:
+            threaded_pdb = parent_structure
+        else:
+            try:
+                thread_sequence_on_backbone_pose(
+                    backbone_pdb=parent_structure,
+                    binder_sequence=final_seq,
+                    out_pdb=threaded_pdb,
+                    binder_chain=context["cdr"].chain_id or "H",
+                )
+            except PipelineError as exc:
+                msg = str(exc)
+                if "Failed to import rfantibody.util.pose" in msg:
+                    threaded_pdb = parent_structure
+                    threading_warning = (
+                        "Pose-threading unavailable (rfantibody import failed); "
+                        "using parent backbone directly for RF2 input."
+                    )
+                else:
+                    raise
+
+        rf2_json = line_dir / "rf2_metrics" / f"{cid}_rf2.json"
+        metrics = run_rf2_filter(
+            cfg=tooling,
+            input_pdb=threaded_pdb,
+            sequence=final_seq,
+            out_json=rf2_json,
+            dry_run=args.dry_run,
+            log_file=logs_dir / f"{line_id}_rf2.log",
+            seed=seed_base,
+            context={
+                "candidate_id": cid,
+                "campaign_name": parent.get("campaign_name", "phase_next_champion_narrow50"),
+                "cdr3_contact_bias": 1,
+            },
+        )
+
+        heuristics = compute_interface_heuristics(
+            pdb_path=Path(str(metrics.get("rf2_best_pdb", threaded_pdb))),
+            parts=framework_parts,
+            h1_len=int(parent["h1_length"]),
+            h3_len=int(parent["h3_length"]),
+            hotspot_tokens=hotspot_set["tokens"],
+            cutoff=5.0,
+        )
+        metrics.update(heuristics)
+        if "structural_plausibility" not in metrics:
+            metrics["structural_plausibility"] = max(
+                0.0, min(1.0, float(metrics.get("rf2_pred_lddt", 0.0)))
+            )
+        ranking_score = round(float(combine_weighted_score(metrics, rank_weights)), 6)
+
+        strict_pass, relaxed_pass = rescue_strict_relaxed_flags(
+            rf2_pae=_safe_float(metrics.get("rf2_pae"), 99.0),
+            rf2_rmsd=_safe_float(metrics.get("design_rf2_rmsd"), 99.0),
+            strict_cfg=strict_cfg,
+            relaxed_cfg=relaxed_cfg,
+        )
+
+        if threading_warning:
+            warning_parts.append(threading_warning)
+        warning = " | ".join(warning_parts)
+        candidates.append(
+            {
+                "phase": phase_name,
+                "line_name": branch_name,
+                "phase_line_id": line_id,
+                "parent_candidate_id": parent["candidate_id"],
+                "parent_ref_source": parent.get("alias_source", ""),
+                "resolved_phase7_job_name": parent.get("resolved_phase7_job_name", ""),
+                "candidate_id": cid,
+                "editable_positions": ",".join(str(x) for x in editable_positions),
+                "fixed_core_positions": ",".join(str(x) for x in fixed_core_positions),
+                "hotspot_set_name": hotspot_set["set_name"],
+                "hotspot_tokens": ",".join(hotspot_set["tokens"]),
+                "full_sequence": final_seq,
+                "strict_pass": int(strict_pass),
+                "relaxed_pass": int(relaxed_pass),
+                "rf2_pae": _safe_float(metrics.get("rf2_pae"), 99.0),
+                "design_vs_rf2_rmsd": _safe_float(metrics.get("design_rf2_rmsd"), 99.0),
+                "ranking_score": ranking_score,
+                "threaded_pdb": str(threaded_pdb),
+                "rf2_best_pdb": str(metrics.get("rf2_best_pdb", "")),
+                "cdr1_edit_count": len(edited_pos),
+                "cdr1_edited_positions": ",".join(str(x) for x in sorted(set(edited_pos))),
+                "warning": warning,
+            }
+        )
+        existing_ids.add(cid)
+
+    field_order = [
+        "phase",
+        "line_name",
+        "phase_line_id",
+        "parent_candidate_id",
+        "parent_ref_source",
+        "resolved_phase7_job_name",
+        "candidate_id",
+        "editable_positions",
+        "fixed_core_positions",
+        "hotspot_set_name",
+        "hotspot_tokens",
+        "full_sequence",
+        "strict_pass",
+        "relaxed_pass",
+        "rf2_pae",
+        "design_vs_rf2_rmsd",
+        "ranking_score",
+        "threaded_pdb",
+        "rf2_best_pdb",
+        "cdr1_edit_count",
+        "cdr1_edited_positions",
+        "warning",
+    ]
+    write_rows(candidates_csv, candidates, field_order)
+
+    write_status(
+        status_path,
+        {
+            "phase": phase_name,
+            "updated_at": now_str(),
+            "resolved_parent_candidate_id": parent["candidate_id"],
+            "resolved_parent_source": parent.get("alias_source", ""),
+            "resolved_phase7_job_name": parent.get("resolved_phase7_job_name", ""),
+            "completed": int(len(candidates) >= target_total),
+            "candidate_rows": int(len(candidates)),
+        },
+    )
+
+    if not candidates:
+        raise PipelineError("phase_next_champion_narrow50 generated no candidate rows.")
+
+    df = pd.DataFrame(candidates)
+    for col in ("strict_pass", "relaxed_pass"):
+        df[col] = df[col].astype(int)
+    for col in ("rf2_pae", "design_vs_rf2_rmsd", "ranking_score"):
+        df[col] = df[col].astype(float)
+    dup = df["full_sequence"].astype(str).duplicated(keep=False)
+    df["unique_sequence_flag"] = (~dup).astype(int)
+    df = df.sort_values(["rf2_pae", "design_vs_rf2_rmsd", "candidate_id"], ascending=[True, True, True])
+
+    summary_csv = root / "results/summaries/phase_next_champion_narrow50_rf2_summary.csv"
+    strict_csv = root / "results/summaries/phase_next_champion_narrow50_strict_pass.csv"
+    strict_fasta = root / "results/summaries/phase_next_champion_narrow50_strict_pass.fasta"
+    summary_md = root / "results/summaries/phase_next_champion_narrow50_summary.md"
+
+    summary_fields = [
+        "parent_candidate_id",
+        "candidate_id",
+        "editable_positions",
+        "hotspot_set_name",
+        "rf2_pae",
+        "design_vs_rf2_rmsd",
+        "ranking_score",
+        "strict_pass",
+        "relaxed_pass",
+        "full_sequence",
+        "unique_sequence_flag",
+        "line_name",
+        "phase_line_id",
+        "hotspot_tokens",
+        "cdr1_edit_count",
+        "cdr1_edited_positions",
+        "threaded_pdb",
+        "rf2_best_pdb",
+        "warning",
+    ]
+    atomic_write_csv(summary_csv, df.to_dict(orient="records"), summary_fields)
+
+    strict_df = df[df["strict_pass"] == 1].copy().sort_values(
+        ["rf2_pae", "design_vs_rf2_rmsd", "candidate_id"],
+        ascending=[True, True, True],
+    )
+    strict_fields = [
+        "parent_candidate_id",
+        "candidate_id",
+        "rf2_pae",
+        "design_vs_rf2_rmsd",
+        "ranking_score",
+        "full_sequence",
+        "unique_sequence_flag",
+        "editable_positions",
+        "hotspot_set_name",
+    ]
+    atomic_write_csv(strict_csv, strict_df.to_dict(orient="records"), strict_fields)
+
+    strict_unique = strict_df.drop_duplicates(subset=["full_sequence"], keep="first")
+    strict_fasta.parent.mkdir(parents=True, exist_ok=True)
+    with strict_fasta.open("w", encoding="utf-8") as handle:
+        for _, row in strict_unique.iterrows():
+            handle.write(f">{row['candidate_id']}\n{row['full_sequence']}\n")
+
+    total = int(df.shape[0])
+    strict_count = int(df["strict_pass"].sum())
+    relaxed_count = int(df["relaxed_pass"].sum())
+    strict_rate = strict_count / max(1, total)
+    relaxed_rate = relaxed_count / max(1, total)
+    df["rf2_quality"] = df["rf2_pae"] + df["design_vs_rf2_rmsd"]
+    best_row = df.sort_values(["rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"]).head(1)
+    top3 = df.sort_values(["rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"]).head(3)
+    top1_quality = float(best_row.iloc[0]["rf2_quality"]) if not best_row.empty else 999.0
+    promising = (strict_count >= 5) or (strict_rate >= 0.10 and top1_quality < 10.0)
+
+    compare_lines: List[str] = []
+    parent_pae = _safe_float(parent.get("rf2_pae"), float("nan"))
+    parent_rmsd = _safe_float(parent.get("design_vs_rf2_rmsd"), float("nan"))
+    if not math.isnan(parent_pae) and not math.isnan(parent_rmsd):
+        parent_quality = parent_pae + parent_rmsd
+        compare_lines.append(
+            f"- Parent RF2 baseline (from existing summaries): pAE={parent_pae:.3f}, RMSD={parent_rmsd:.3f}, quality={parent_quality:.3f}"
+        )
+    prev_table = root / "results/summaries/phase_next_test1_local_maturation_rf2_summary.csv"
+    if prev_table.exists():
+        try:
+            prev_df = pd.read_csv(prev_table)
+            if not prev_df.empty and {"rf2_pae", "design_vs_rf2_rmsd"}.issubset(prev_df.columns):
+                prev_df["rf2_quality"] = prev_df["rf2_pae"].astype(float) + prev_df["design_vs_rf2_rmsd"].astype(float)
+                prow = prev_df.sort_values(["rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"]).iloc[0]
+                compare_lines.append(
+                    f"- Recent benchmark (phase_next_test1_local_maturation best): "
+                    f"candidate={cell_to_str(prow.get('candidate_id'))}, "
+                    f"pAE={float(prow['rf2_pae']):.3f}, RMSD={float(prow['design_vs_rf2_rmsd']):.3f}, "
+                    f"quality={float(prow['rf2_quality']):.3f}"
+                )
+        except Exception:
+            pass
+    phase6_table = root / "results/summaries/phase6_cdr1_rescue_final_ranked_candidates.csv"
+    if phase6_table.exists():
+        try:
+            p6 = pd.read_csv(phase6_table)
+            if not p6.empty and {"rf2_pae", "design_rf2_rmsd"}.issubset(p6.columns):
+                p6["rf2_quality"] = p6["rf2_pae"].astype(float) + p6["design_rf2_rmsd"].astype(float)
+                r6 = p6.sort_values(["rf2_quality", "rf2_pae", "design_rf2_rmsd"]).iloc[0]
+                compare_lines.append(
+                    f"- Recent benchmark (phase6 best): candidate={cell_to_str(r6.get('candidate_id'))}, "
+                    f"pAE={float(r6['rf2_pae']):.3f}, RMSD={float(r6['design_rf2_rmsd']):.3f}, "
+                    f"quality={float(r6['rf2_quality']):.3f}"
+                )
+        except Exception:
+            pass
+
+    lines = [SAFETY_ETHICS_STATEMENT, "", "# Champion Narrow50 Local Maturation (RF2-Only)", ""]
+    lines.append(f"- Resolved parent candidate ID: `{parent['candidate_id']}`")
+    lines.append(f"- Parent resolution source: `{parent.get('alias_source', '')}`")
+    lines.append(f"- Stage7 best job used for parent resolution: `{parent.get('resolved_phase7_job_name', '')}`")
+    lines.append(
+        f"- Shared hotspot set: `{hotspot_set['set_name']}` ({', '.join(hotspot_set['tokens'])})"
+    )
+    lines.append("")
+    lines.append(f"- Total candidates generated: {total}")
+    lines.append(f"- Strict pass: {strict_count}/{total} ({strict_rate:.1%})")
+    lines.append(f"- Relaxed pass: {relaxed_count}/{total} ({relaxed_rate:.1%})")
+    if not best_row.empty:
+        row = best_row.iloc[0]
+        lines.append(
+            f"- Best RF2 candidate: `{row['candidate_id']}` "
+            f"(pAE={float(row['rf2_pae']):.3f}, RMSD={float(row['design_vs_rf2_rmsd']):.3f}, quality={float(row['rf2_quality']):.3f})"
+        )
+    lines.append("- Top 3 RF2 candidates:")
+    for _, row in top3.iterrows():
+        lines.append(
+            f"  - `{row['candidate_id']}` "
+            f"(pAE={float(row['rf2_pae']):.3f}, RMSD={float(row['design_vs_rf2_rmsd']):.3f}, quality={float(row['rf2_quality']):.3f})"
+        )
+    lines.append("")
+    lines.append("## RF2 Benchmark Comparison")
+    if compare_lines:
+        lines.extend(compare_lines)
+    else:
+        lines.append("- No prior benchmark tables were available locally for quantitative comparison.")
+    lines.append("")
+    lines.append(
+        f"- Promising for later AF3/manual evaluation and larger-scale expansion: {'yes' if promising else 'no'}"
+    )
+    lines.append("- This conclusion is RF2-only and does not claim AF3/interface improvement.")
+    summary_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 def run_phase_design(
     phase_name: str,
@@ -3798,6 +4482,10 @@ def write_project_summary(context: dict):
             "phase_next_test1_local_maturation",
             root / "results/summaries/phase_next_test1_local_maturation_rf2_summary.csv",
         ),
+        (
+            "phase_next_champion_narrow50",
+            root / "results/summaries/phase_next_champion_narrow50_rf2_summary.csv",
+        ),
     ]
 
     lines = [SAFETY_ETHICS_STATEMENT, "", "# Pipeline Summary", ""]
@@ -3861,6 +4549,8 @@ def run_single_phase(phase_name: str, context: dict, args: argparse.Namespace):
         run_phase6_cdr1_rescue_main(context=context, args=args)
     elif phase_name == "phase_next_test1_local_maturation":
         run_phase_next_test1_local_maturation(context=context, args=args)
+    elif phase_name == "phase_next_champion_narrow50":
+        run_phase_next_champion_narrow50(context=context, args=args)
     else:
         raise PipelineError(f"Unsupported phase: {phase_name}")
 
@@ -3920,6 +4610,7 @@ def main() -> int:
         "phase5_cdr1_rescue_pilot",
         "phase6_cdr1_rescue_main",
         "phase_next_test1_local_maturation",
+        "phase_next_champion_narrow50",
     ]
 
     if args.phase == "all":

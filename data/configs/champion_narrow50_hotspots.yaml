@@ -1,0 +1,4 @@
+champion_narrow50_hotspot_sets:
+  Champion_consensus_narrow_patch:
+    description: "Narrowed champion-consensus local hotspot patch"
+    tokens: ["B217", "B218", "B219", "C121", "C122", "C124"]

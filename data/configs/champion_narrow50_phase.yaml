@@ -1,0 +1,31 @@
+champion_narrow50:
+  # Auto-resolve parent from Phase7 AF3 ranked summary (strict 5/5 subset, then ranked by AF3 quality columns).
+  phase7_ranked_summary_csv: results/summaries/af3_stage7_ranked_summary_with_wt_test1.csv
+  phase7_af3_results_dir: AF3 Results/Stage7 AF3
+  # Optional explicit map CSV if needed:
+  # stage7_job_map_csv: results/af3_web_exports_strict_pass_YYYY-MM-DD_HHMMSS/af3_strict_pass_all_map.csv
+
+  # Single narrowed local maturation line.
+  line_name: Champion_Narrow50
+  candidates_total: 50
+
+  # Shared narrowed hotspot patch.
+  hotspot_set_name: Champion_consensus_narrow_patch
+
+  # Keep core primary-contact positions fixed.
+  fixed_core_positions: ["H1:27", "H1:28", "H1:29", "H1:30", "H1:33", "H1:34"]
+
+  # Only these positions are editable in this round.
+  editable_positions: ["H1:25", "H1:26", "H1:31", "FR:37", "FR:39"]
+
+  # Local sequence mutation controls (fixed-backbone threading + RF2 only).
+  aa_alphabet: ACDEFGHIKLMNPQRSTVWY
+  min_mutations_per_candidate: 1
+  max_mutations_per_candidate: 3
+
+  strict_thresholds:
+    rf2_pae_max: 10.0
+    design_rf2_rmsd_max: 2.0
+  relaxed_thresholds:
+    rf2_pae_max: 12.0
+    design_rf2_rmsd_max: 2.5
