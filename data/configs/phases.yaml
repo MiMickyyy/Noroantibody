@@ -48,3 +48,7 @@ phases:
     description: "Champion-consensus narrowed local maturation (single line, 50 candidates, RF2-only)"
     input_from_phase: phase_next_test1_local_maturation
     candidates_total: 50
+  phase9_test1_local_maturation_expand150:
+    description: "Phase9: return to Phase7 Test1 dual-branch local maturation conditions, 150 candidates per branch (RF2-only)"
+    input_from_phase: phase_next_champion_narrow50
+    candidates_per_branch: 150

@@ -36,6 +36,7 @@ Not included by design:
 ├── phase6_cdr1_rescue_main/
 ├── phase_next_test1_local_maturation/
 ├── phase_next_champion_narrow50/
+├── phase9_test1_local_maturation_expand150/
 ├── results/
 │   ├── summaries/
 │   ├── rf2_passed/
@@ -178,6 +179,7 @@ python scripts/run_pipeline.py --phase phase3_main_campaign
 python scripts/run_pipeline.py --phase phase4_h2_refine
 python scripts/run_pipeline.py --phase phase5_cdr1_rescue_pilot
 python scripts/run_pipeline.py --phase phase6_cdr1_rescue_main
+python scripts/run_pipeline.py --phase phase9_test1_local_maturation_expand150
 ```
 
 Phase4 custom selected table (recommended when you manually pick 25 from phase3):
@@ -232,6 +234,7 @@ bash scripts/run_phase3.sh
 bash scripts/run_phase4.sh
 bash scripts/run_phase5.sh
 bash scripts/run_phase6.sh
+bash scripts/run_phase9_test1_local_maturation_expand150.sh
 ```
 
 ### Dry-run and limited debug batch
@@ -421,6 +424,36 @@ Generated outputs:
 - `results/summaries/phase_next_test1_local_maturation_strict_pass.csv`
 - `results/summaries/phase_next_test1_local_maturation_strict_pass.fasta`
 - `results/summaries/phase_next_test1_local_maturation_summary.md`
+
+## Phase9 Test1 Dual-Branch Expansion150 (Back To Phase7 Conditions)
+
+This repository includes a Phase9 follow-up that reuses the Phase7/Test1 dual-branch setup and only changes scale:
+
+- parent: same Test1 parent resolution and sequence/structure source as `phase_next_test1_local_maturation`
+- branches: same two branches (`Branch_A_H1_edge_only`, `Branch_B_H1_plus_FR_support`)
+- hotspots: same `Test1_defect_guided` set (`B75, B217, B219, C122, C124`)
+- fixed/editable rules: unchanged from Phase7 local maturation
+- scale: `150` candidates per branch (`300` total)
+- evaluation: RF2-only (strict/relaxed), no local AF3
+
+Run command:
+
+```bash
+python scripts/run_pipeline.py --phase phase9_test1_local_maturation_expand150 --execute --resume
+```
+
+Convenience script:
+
+```bash
+bash scripts/run_phase9_test1_local_maturation_expand150.sh --execute --resume
+```
+
+Generated outputs:
+
+- `results/summaries/phase9_test1_local_maturation_expand150_rf2_summary.csv`
+- `results/summaries/phase9_test1_local_maturation_expand150_strict_pass.csv`
+- `results/summaries/phase9_test1_local_maturation_expand150_strict_pass.fasta`
+- `results/summaries/phase9_test1_local_maturation_expand150_summary.md`
 
 ## Champion Narrow50 Local Maturation (Phase8 Incremental Follow-up)
 

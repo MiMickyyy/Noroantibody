@@ -191,6 +191,7 @@ def parse_args() -> argparse.Namespace:
             "phase6_cdr1_rescue_main",
             "phase_next_test1_local_maturation",
             "phase_next_champion_narrow50",
+            "phase9_test1_local_maturation_expand150",
             "all",
         ],
     )
@@ -2849,10 +2850,14 @@ def mutate_local_positions(
     return "".join(seq), sorted(set(edited))
 
 
-def run_phase_next_test1_local_maturation(context: dict, args: argparse.Namespace):
+def run_phase_next_test1_local_maturation(
+    context: dict,
+    args: argparse.Namespace,
+    phase_name: str = "phase_next_test1_local_maturation",
+):
     root = context["root"]
     phases = context["phases_cfg"].get("phases", {})
-    phase_cfg = phases.get("phase_next_test1_local_maturation", {})
+    phase_cfg = phases.get(phase_name, {})
     local_cfg_root = context.get("test1_local_cfg", {}) or {}
     hotspot_cfg_root = context.get("test1_local_hotspots", {}) or {}
     if not local_cfg_root:
@@ -2913,7 +2918,7 @@ def run_phase_next_test1_local_maturation(context: dict, args: argparse.Namespac
     if args.limit_per_combination is not None:
         target_per_branch = min(target_per_branch, int(args.limit_per_combination))
     if target_per_branch <= 0:
-        raise PipelineError("candidates_per_branch must be > 0 for phase_next_test1_local_maturation.")
+        raise PipelineError(f"candidates_per_branch must be > 0 for {phase_name}.")
 
     aa_alphabet = re.sub(r"[^A-Z]", "", cell_to_str(local_cfg.get("aa_alphabet", "ACDEFGHIKLMNPQRSTVWY")).upper())
     if not aa_alphabet:
@@ -2928,7 +2933,6 @@ def run_phase_next_test1_local_maturation(context: dict, args: argparse.Namespac
     seed_base = int(pipeline_cfg.get("project", {}).get("random_seed", 20260316))
     framework_parts = split_framework_and_cdr(context["nanobody_seq"], context["cdr"])
 
-    phase_name = "phase_next_test1_local_maturation"
     phase_dir = root / phase_name
     branches_dir = phase_dir / "branches"
     logs_dir = root / "logs" / phase_name
@@ -3167,7 +3171,7 @@ def run_phase_next_test1_local_maturation(context: dict, args: argparse.Namespac
         if cfile.exists():
             all_rows.extend(pd.read_csv(cfile).to_dict(orient="records"))
     if not all_rows:
-        raise PipelineError("phase_next_test1_local_maturation generated no candidate rows.")
+        raise PipelineError(f"{phase_name} generated no candidate rows.")
 
     df = pd.DataFrame(all_rows)
     for col in ("strict_pass", "relaxed_pass"):
@@ -3178,10 +3182,10 @@ def run_phase_next_test1_local_maturation(context: dict, args: argparse.Namespac
     df["unique_sequence_flag"] = (~dup).astype(int)
     df = df.sort_values(["branch_name", "rf2_pae", "design_vs_rf2_rmsd", "candidate_id"], ascending=[True, True, True, True])
 
-    summary_csv = root / "results/summaries/phase_next_test1_local_maturation_rf2_summary.csv"
-    strict_csv = root / "results/summaries/phase_next_test1_local_maturation_strict_pass.csv"
-    strict_fasta = root / "results/summaries/phase_next_test1_local_maturation_strict_pass.fasta"
-    summary_md = root / "results/summaries/phase_next_test1_local_maturation_summary.md"
+    summary_csv = root / f"results/summaries/{phase_name}_rf2_summary.csv"
+    strict_csv = root / f"results/summaries/{phase_name}_strict_pass.csv"
+    strict_fasta = root / f"results/summaries/{phase_name}_strict_pass.fasta"
+    summary_md = root / f"results/summaries/{phase_name}_summary.md"
 
     summary_fields = [
         "branch_name",
@@ -3228,7 +3232,12 @@ def run_phase_next_test1_local_maturation(context: dict, args: argparse.Namespac
         for _, row in strict_unique.iterrows():
             handle.write(f">{row['candidate_id']}\n{row['full_sequence']}\n")
 
-    branch_lines: List[str] = [SAFETY_ETHICS_STATEMENT, "", "# Test1 Local Maturation (RF2-Only)", ""]
+    branch_lines: List[str] = [
+        SAFETY_ETHICS_STATEMENT,
+        "",
+        f"# Test1 Local Maturation (RF2-Only): {phase_name}",
+        "",
+    ]
     branch_lines.append(f"- Resolved Test1 parent candidate ID: `{parent['candidate_id']}`")
     branch_lines.append(f"- Test1 resolution source: `{parent['alias_source']}`")
     branch_lines.append(f"- Shared hotspot set: `{hotspot_set['set_name']}` ({', '.join(hotspot_set['tokens'])})")
@@ -3305,6 +3314,14 @@ def run_phase_next_test1_local_maturation(context: dict, args: argparse.Namespac
         )
 
     summary_md.write_text("\n".join(branch_lines) + "\n", encoding="utf-8")
+
+
+def run_phase9_test1_local_maturation_expand150(context: dict, args: argparse.Namespace):
+    run_phase_next_test1_local_maturation(
+        context=context,
+        args=args,
+        phase_name="phase9_test1_local_maturation_expand150",
+    )
 
 
 def run_phase_next_champion_narrow50(context: dict, args: argparse.Namespace):
@@ -4624,6 +4641,10 @@ def write_project_summary(context: dict):
             "phase_next_champion_narrow50",
             root / "results/summaries/phase_next_champion_narrow50_rf2_summary.csv",
         ),
+        (
+            "phase9_test1_local_maturation_expand150",
+            root / "results/summaries/phase9_test1_local_maturation_expand150_rf2_summary.csv",
+        ),
     ]
 
     lines = [SAFETY_ETHICS_STATEMENT, "", "# Pipeline Summary", ""]
@@ -4689,6 +4710,8 @@ def run_single_phase(phase_name: str, context: dict, args: argparse.Namespace):
         run_phase_next_test1_local_maturation(context=context, args=args)
     elif phase_name == "phase_next_champion_narrow50":
         run_phase_next_champion_narrow50(context=context, args=args)
+    elif phase_name == "phase9_test1_local_maturation_expand150":
+        run_phase9_test1_local_maturation_expand150(context=context, args=args)
     else:
         raise PipelineError(f"Unsupported phase: {phase_name}")
 
@@ -4749,6 +4772,7 @@ def main() -> int:
         "phase6_cdr1_rescue_main",
         "phase_next_test1_local_maturation",
         "phase_next_champion_narrow50",
+        "phase9_test1_local_maturation_expand150",
     ]
 
     if args.phase == "all":
