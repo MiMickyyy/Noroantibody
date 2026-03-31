@@ -2670,6 +2670,144 @@ def resolve_best_phase7_parent_candidate(context: dict, local_cfg: dict) -> dict
     return parent
 
 
+def resolve_champion_narrow50_parent_candidate(context: dict, local_cfg: dict) -> dict:
+    root = context["root"]
+    explicit_seq = cell_to_str(local_cfg.get("parent_full_sequence", ""))
+    explicit_ref = cell_to_str(
+        local_cfg.get("parent_candidate_id")
+        or local_cfg.get("parent_candidate_ref")
+    )
+    explicit_structure = resolve_path_like(root, cell_to_str(local_cfg.get("parent_structure_pdb", "")))
+
+    # Preferred behavior for phase8: if explicit parent sequence is provided, skip Stage7 AF3 auto-resolution.
+    if explicit_seq:
+        full_seq = _normalize_parent_sequence(
+            explicit_seq,
+            "champion_narrow50.parent_full_sequence",
+            explicit_ref or "champion_narrow50_explicit_parent",
+        )
+        index = _candidate_index_for_local_maturation(root)
+
+        def _preferred_structure_path(crow: dict) -> str:
+            return (
+                cell_to_str(crow.get("rf2_best_pdb"))
+                or cell_to_str(crow.get("threaded_pdb"))
+                or cell_to_str(crow.get("designed_pdb"))
+                or cell_to_str(crow.get("backbone_pdb"))
+                or cell_to_str(crow.get("parent_backbone_pdb"))
+            )
+
+        def _existing_structure_path(crow: dict) -> str:
+            p = _preferred_structure_path(crow)
+            if not p or "MISSING_PARENT_PDB_PLACEHOLDER" in p:
+                return ""
+            try:
+                if Path(p).exists():
+                    return p
+            except Exception:
+                return ""
+            return ""
+
+        row: Optional[dict] = None
+        alias_source = "champion_narrow50_explicit_sequence"
+
+        if explicit_ref and explicit_ref in index:
+            row = dict(index[explicit_ref])
+            alias_source += " + parent_candidate_id"
+
+        if row is None:
+            seq_matches: List[Tuple[str, dict]] = []
+            for cid, crow in index.items():
+                try:
+                    seq = _normalize_parent_sequence(
+                        cell_to_str(crow.get("full_sequence")),
+                        f"candidate_index[{cid}]",
+                        cid,
+                    )
+                except Exception:
+                    continue
+                if seq == full_seq:
+                    seq_matches.append((cid, dict(crow)))
+            if seq_matches:
+                seq_matches = sorted(
+                    seq_matches,
+                    key=lambda x: (1 if _existing_structure_path(x[1]) else 0, x[0]),
+                    reverse=True,
+                )
+                row = seq_matches[0][1]
+                alias_source += f" + sequence_match({seq_matches[0][0]})"
+
+        structure_pdb = ""
+        if explicit_structure is not None and explicit_structure.exists():
+            structure_pdb = str(explicit_structure)
+            alias_source += " + explicit_structure"
+        elif row is not None:
+            structure_pdb = _existing_structure_path(row)
+
+        if not structure_pdb:
+            raise PipelineError(
+                "Explicit phase8 parent sequence is set, but no usable structure path was found. "
+                "Set champion_narrow50.parent_structure_pdb in data/configs/champion_narrow50_phase.yaml."
+            )
+
+        parent_id = explicit_ref or cell_to_str(row.get("candidate_id") if row else "") or "champion_narrow50_explicit_parent"
+
+        h1_len = parse_int_maybe(
+            local_cfg.get("parent_h1_length"),
+            parse_int_maybe((row or {}).get("h1_length"), context["cdr"].h1_len),
+        )
+        h3_len = parse_int_maybe(
+            local_cfg.get("parent_h3_length"),
+            parse_int_maybe((row or {}).get("h3_length"), context["cdr"].h3_len),
+        )
+        cid_h1, cid_h3 = _parse_h1_h3_from_combo_id(parent_id)
+        if cid_h1 is not None:
+            h1_len = int(cid_h1)
+        if cid_h3 is not None:
+            h3_len = int(cid_h3)
+
+        parts = split_framework_and_cdr(context["nanobody_seq"], context["cdr"])
+        h1_seq = cell_to_str(local_cfg.get("parent_h1_sequence")) or cell_to_str((row or {}).get("h1_sequence"))
+        h2_seq = cell_to_str(local_cfg.get("parent_h2_sequence")) or cell_to_str((row or {}).get("h2_sequence"))
+        h3_seq = cell_to_str(local_cfg.get("parent_h3_sequence")) or cell_to_str((row or {}).get("h3_sequence"))
+        if not (h1_seq and h2_seq and h3_seq):
+            h1_guess, h2_guess, h3_guess = split_designed_sequence(
+                parts=parts,
+                full_seq=full_seq,
+                h1_len=int(h1_len),
+                h3_len=int(h3_len),
+            )
+            h1_seq = h1_seq or h1_guess
+            h2_seq = h2_seq or h2_guess
+            h3_seq = h3_seq or h3_guess
+
+        out = {
+            "candidate_id": parent_id,
+            "alias_source": alias_source,
+            "full_sequence": full_seq,
+            "h1_length": int(h1_len),
+            "h2_length": len(h2_seq),
+            "h3_length": int(h3_len),
+            "h1_sequence": h1_seq,
+            "h2_sequence": h2_seq,
+            "h3_sequence": h3_seq,
+            "structure_pdb": structure_pdb,
+            "combination_id": cell_to_str((row or {}).get("combination_id") or (row or {}).get("parent_combination_id")),
+            "campaign_name": cell_to_str((row or {}).get("campaign_name") or (row or {}).get("parent_campaign_name")),
+            "rf2_pae": _safe_float((row or {}).get("rf2_pae"), float("nan")),
+            "design_vs_rf2_rmsd": _safe_float(
+                (row or {}).get("design_vs_rf2_rmsd", (row or {}).get("design_rf2_rmsd")),
+                float("nan"),
+            ),
+            "ranking_score": _safe_float((row or {}).get("ranking_score"), float("nan")),
+            "resolved_phase7_job_name": "",
+            "resolved_phase7_parent_ref": parent_id,
+        }
+        return out
+
+    return resolve_best_phase7_parent_candidate(context=context, local_cfg=local_cfg)
+
+
 def mutate_local_positions(
     parent_seq: str,
     editable_positions: Sequence[int],
@@ -3188,7 +3326,7 @@ def run_phase_next_champion_narrow50(context: dict, args: argparse.Namespace):
     if not local_cfg:
         raise PipelineError("Missing 'champion_narrow50' block in narrowed champion config.")
 
-    parent = resolve_best_phase7_parent_candidate(context=context, local_cfg=local_cfg)
+    parent = resolve_champion_narrow50_parent_candidate(context=context, local_cfg=local_cfg)
     hotspot_set_name = cell_to_str(local_cfg.get("hotspot_set_name", "Champion_consensus_narrow_patch"))
     hotspot_set = build_champion_narrow50_hotspot_set(hotspot_cfg_root, set_name=hotspot_set_name)
 

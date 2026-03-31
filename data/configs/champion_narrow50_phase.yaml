@@ -1,5 +1,16 @@
 champion_narrow50:
-  # Auto-resolve parent from Phase7 AF3 ranked summary (strict 5/5 subset, then ranked by AF3 quality columns).
+  # Parent resolution mode:
+  # 1) If parent_full_sequence is set, phase8 uses explicit parent mode and skips Stage7 auto-resolution.
+  # 2) If parent_full_sequence is empty, fallback to Stage7 ranked-summary auto-resolution.
+  parent_candidate_id: spg3_014
+  parent_full_sequence: QVQLQESGGGLVQPGGSLRLSCTYTPKPAHNVVATMWYAQAPEKQRELVATGAVGGNVGYADSVKGRFTISRDNAKRTVYLQMNDLKPEDAAVYYCNIIDDSAVRYEGQGTQVTVSSHHHHHH
+  parent_h1_length: 13
+  parent_h3_length: 11
+  # Optional explicit structure path; if blank, pipeline tries to resolve from existing candidate tables by ID/sequence.
+  parent_structure_pdb: ""
+
+  # Auto-resolve parent from Phase7 AF3 ranked summary (strict 5/5 subset, then ranked by AF3 quality columns)
+  # only when parent_full_sequence is empty.
   phase7_ranked_summary_csv: results/summaries/af3_stage7_ranked_summary_with_wt_test1.csv
   phase7_af3_results_dir: AF3 Results/Stage7 AF3
   # Optional explicit map CSV if needed:

@@ -427,7 +427,8 @@ Generated outputs:
 This repository also includes a **single-line champion-consensus narrowed local maturation** stage:
 
 - Parent:
-  - auto-resolved from Phase7 AF3 ranked summary (`strict 5/5` subset, then ranked by AF3 quality columns)
+  - preferred: explicit parent sequence mode via `champion_narrow50.parent_full_sequence`
+  - fallback: auto-resolved from Phase7 AF3 ranked summary (`strict 5/5` subset, then ranked by AF3 quality columns)
   - real parent candidate ID is recorded in outputs/status
 - Scope:
   - one narrowed line, total `50` candidates (no branching)
