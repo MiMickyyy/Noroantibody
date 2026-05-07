@@ -1,71 +1,151 @@
-# Norovirus CHDC2094 Nanobody Redesign Pipeline (RFantibody Core)
+# Noroantibody: A Stage-Wise Computational Pipeline for Norovirus Nanobody Redesign
 
-Safety and Ethics Statement:
-This study is a computational structural modeling and protein design project focused on nanobody–Norovirus interactions. The work uses Virus-Like Particle (VLP)-related structural information only and does not involve infectious virus, viral propagation, animal experiments, human subjects, clinical samples, or wet-lab experimental procedures. All project activities are conducted under institutional safety and ethics oversight at the University of California, Riverside.
+## Abstract
+This repository contains the computational redesign pipeline developed for a Norovirus CHDC2094 nanobody optimization project. The project starts from a known nanobody–P-domain dimer system and moves through a staged workflow built around antibody-tuned RFdiffusion, ProteinMPNN, RF2-based surrogate filtering, and downstream AF3-guided analysis. The overall strategy is deliberately funnel-shaped: begin with broad hotspot-guided exploration, narrow the search using fast structural surrogates, then spend computation only on region-focused local maturation lines. The repository therefore serves two roles: it is both the execution framework for the design campaign and the reproducible record of how candidate logic evolved through Stage 9.
 
-## Scope
+The central scientific outcome is not simple recovery of the wild-type (WT) binder. WT remains the stability reference, but later-stage designed candidates repeatedly favor an alternative interface logic. Across the later rounds, CDR1-centered behavior and local support around that region emerge as the main mechanistic differentiator, especially when comparing broader alternative-pose candidates to more compact support-coupled candidates.
 
-This repository implements a complete, execution-ready local pipeline for computational nanobody redesign against the Norovirus CHDC2094 P-domain dimer using the approved RFantibody-style core workflow:
+## Safety and Scope
+This is a computational structural modeling and protein design repository only.
 
-1. antibody-finetuned RFdiffusion (backbone + dock generation)
-2. ProteinMPNN (sequence design)
-3. antibody-finetuned RF2 (primary filtering)
-4. stop after H2 sequence optimization and export final top 25
+- No infectious virus work
+- No viral propagation
+- No animal or human experimentation
+- No clinical samples
+- No wet-lab protocols
+- No local AlphaFold 3 deployment in this repository
 
-Not included by design:
-- no local AlphaFold 3 deployment
-- AF3 will be run manually via web by the user after this pipeline
+AF3 in this project was used as an external downstream analysis layer after RF2-based triage.
 
-## Directory layout
+## What This Repository Includes
+This repository is the **pipeline-focused** codebase.
 
+Included:
+- RFantibody-style stage orchestration
+- hotspot campaign definitions
+- target preparation and input sanitation
+- ProteinMPNN / RF2 / RFdiffusion wrappers
+- local phase runners through Stage 9 logic
+- result parsing, filtering, reranking, and export scripts
+- AF3 post-analysis helper scripts used after external AF3 runs
+
+Intentionally not versioned here:
+- large cloud/VM intermediate outputs
+- AF3 raw result folders
+- downloaded model weights and large third-party framework payloads
+- the separate BIEN225 cellular automaton module (maintained in the companion repository `Noroantibody_AC`)
+
+## Pipeline Framework Through Stage 9
+The project is best understood as a compact four-part framework rather than a long chronological log.
+
+### 1. Broad exploration
+Goal: identify which antigen-side hotspot logic is worth pursuing.
+
+Core pattern:
+- generate backbones with antibody-aware RFdiffusion
+- design sequences with ProteinMPNN
+- screen designs with RF2
+
+Main search families:
+- coarse pilot and focused pilot campaigns
+- multi-hotspot main campaign lines, especially the later-successful `campaign_C_A_plus_pocket_rim_HBGA_adjacent_*` family
+
+### 2. Narrowing with surrogate filtering
+Goal: avoid expensive full downstream analysis on weak lines.
+
+Primary filters:
+- RF2 pAE
+- design-vs-RF2 RMSD
+- candidate ranking tables
+- combination-level summaries
+
+This step turned the project from a broad hotspot search into a practical shortlist-driven workflow.
+
+### 3. Region-focused optimization
+Goal: stop doing broad redesign and instead refine the local interface logic.
+
+Main local refinement themes:
+- H2 optimization
+- CDR1 rescue and rescue-condition ranking
+- Test1-centered local maturation
+- narrowed champion line refinement
+- Phase 9 expansion of the Test1-derived branches
+
+Scientific interpretation:
+- the later-stage problem was not “find any binder”
+- it was “preserve a viable alternative mode and improve how local support stabilizes it”
+
+### 4. Final shortlisted candidates
+By the end of Stage 9, the project had three useful reference points for downstream interpretation:
+- `WT`: stability and interface-maturity reference
+- `spg3_024`: broader alternative-pose comparator
+- `p9c_052 / spg1_020`: compact alternative-pose candidate
+
+## Stage Map
+| Stage | Purpose | Main output |
+|---|---|---|
+| Phase 0 | smoke test and environment validation | minimal executable check |
+| Phase 1 | coarse hotspot exploration | top combinations shortlist |
+| Phase 2 | focused pilot refinement | narrowed campaign choices |
+| Phase 3 | main campaign | top 25 pre-H2 candidates |
+| Phase 4 | H2 refinement | H2-optimized shortlist |
+| Phase 5 | CDR1 rescue pilot | rescue-condition ranking |
+| Phase 6 | CDR1 rescue expansion | rescue candidate ranking |
+| Phase 7/8 analysis layer | AF3-guided local maturation interpretation | champion-consensus logic |
+| Phase 9 | Test1-derived branch expansion | expanded local maturation panel |
+
+A more detailed stage summary is provided in [`docs/pipeline_stage_summary.md`](docs/pipeline_stage_summary.md).
+
+## Key Scientific Conclusions Carried Forward
+These are the project conclusions that mattered most by the end of Stage 9.
+
+1. **WT remains the stability reference.**  
+   WT is not trivially displaced by designed sequences when judged using AF3-native confidence and interface consistency.
+
+2. **The designed family does not simply become WT.**  
+   The strongest designed candidates repeatedly favor an alternative interface pattern rather than a clean WT-like recovery.
+
+3. **CDR1 behavior is a late-stage control point.**  
+   Later optimization lines repeatedly converged on CDR1-support logic as the most useful local lever for improving or destabilizing the alternative pose family.
+
+4. **Compactness and support-coupling matter.**  
+   Within the designed family, the stronger candidates are not just “higher scoring”; they tend to be more compact and more support-coupled around the alternative core logic.
+
+## Repository Layout
 ```text
 .
 ├── data/
-│   ├── raw/
-│   ├── processed/
-│   ├── target/
-│   ├── framework/
-│   ├── maps/
-│   └── configs/
-├── phase0_smoke/
-├── phase1_coarse_pilot/
-├── phase2_focused_pilot/
-├── phase3_main_campaign/
-├── phase4_h2_refine/
-├── phase5_cdr1_rescue_pilot/
-├── phase6_cdr1_rescue_main/
-├── phase_next_test1_local_maturation/
-├── phase_next_champion_narrow50/
-├── phase9_test1_local_maturation_expand150/
-├── results/
-│   ├── summaries/
-│   ├── rf2_passed/
-│   ├── final_25/
-│   └── af3_web_exports/
-├── logs/
-├── scripts/
-└── README.md
+│   ├── configs/                 # pipeline, phase, hotspot, tooling, and CDR configs
+│   ├── maps/                    # residue mapping tables
+│   ├── processed/               # lightweight derived metadata
+│   ├── raw/                     # lightweight provenance metadata only in git
+│   └── target/                  # prepared target examples and reports
+├── docs/
+├── scripts/                     # orchestration, parsing, analysis, and export scripts
+├── README.md
+├── environment.yml
+├── requirements.txt
+└── config.yaml
 ```
 
-## Environment setup
-
+## Installation
 ### Option A: conda
-
 ```bash
 conda env create -f environment.yml
 conda activate noro_rfantibody
 ```
 
-### Option B: pip
-
+### Option B: venv + pip
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Install RFantibody tooling (required for `--execute`)
+## External Tooling Requirement
+The repository expects RFantibody-style tooling to be installed separately.
 
+Typical setup:
 ```bash
 cd data/framework/external/RFantibody
 pip install -e .
@@ -73,104 +153,28 @@ bash include/download_weights.sh
 cd -
 ```
 
-After installation, verify commands:
+The external framework directory is intentionally not packaged into git because of size and third-party ownership.
 
-```bash
-rfdiffusion --help
-proteinmpnn --help
-rf2 --help
-```
-
-## Input files
-
-Place these in project root (or update `data/configs/pipeline.yaml`):
-
+## Minimal Input Files
+Project-root examples used during development include:
 - `VP1.prot`
-- `P-domain dimer.fasta`
-- `Nanobody.fasta`
-- `nanobody framework` structure file (PDB/mmCIF), and set:
-  - `inputs.nanobody_framework_pdb_file` in `data/configs/pipeline.yaml`
+- `P-domain dimer.prot`
+- `Nanobody.fa`
+- framework structure and target structure inputs referenced by config
 
-The pipeline handles filenames with spaces by creating documented sanitized symlink aliases under `data/raw/sanitized/`.
-It does not silently rename user files.
+The input-resolution helpers sanitize filenames with spaces and record exact aliases instead of silently renaming source files.
 
-## Critical manual input: CDR boundaries
-
-You must provide validated H1/H2/H3 residue ranges before phase execution.
-
-Edit:
-- `data/configs/cdr_boundaries.yaml`
-
-Or use helper:
-
-```bash
-python scripts/manage_cdr_boundaries.py show
-python scripts/manage_cdr_boundaries.py set --h1 23 34 --h2 50 58 --h3 97 106 --chain C
-```
-
-If boundaries are missing, pipeline fails loudly.
-
-## Step 0: prepare inputs (safe aliases)
-
+## Core Run Pattern
+Prepare inputs and targets:
 ```bash
 python scripts/prepare_inputs.py
-```
-
-This resolves filenames with spaces and writes:
-
-- `data/raw/sanitized/input_aliases.json`
-- `data/processed/resolved_inputs.yaml`
-
-## Step 1: target preparation
-
-This prepares:
-
-1. full cleaned P-domain dimer (chains A/B)
-2. cropped top-cap dimer for design stage
-3. mapping table between structure numbering / crop / P-domain / full-length VP1 (when inferable)
-
-```bash
 python scripts/prepare_targets.py \
   --pipeline-config data/configs/pipeline.yaml \
   --campaign-config data/configs/hotspot_campaigns.yaml
-```
-
-If no local antigen structure is provided, the script downloads 5IYN biological assembly 1 and records provenance under `data/raw/external_sources.json`.
-
-## Auto-detect tooling/runtime (no guessing)
-
-Before production execution, run:
-
-```bash
 python scripts/autodetect_runtime_and_tooling.py --strict
 ```
 
-Outputs:
-
-- `data/processed/autodetect_report.json`
-- `data/configs/tooling.detected.yaml`
-- `data/processed/unresolved_fields.txt`
-
-If unresolved fields exist, fix only those fields and rerun detection. Do not proceed to `--execute` until unresolved fields are empty.
-
-### Verified RFantibody CLI contracts used by wrappers
-
-From `RFantibody` repo (`src/rfantibody/cli/inference.py`):
-
-- `rfdiffusion`:
-  - required: `--target`, `--framework`
-  - used by pipeline: `--output`, `--num-designs`, `--design-loops`, `--hotspots`, `--weights`, `--diffuser-t`, `--final-step`, `--deterministic`, `--no-trajectory`
-- `proteinmpnn`:
-  - required: `--input-dir` or `--input-quiver`
-  - used by pipeline: `--output-dir`, `--loops`, `--seqs-per-struct`, `--temperature`, `--weights`, `--deterministic`
-- `rf2`:
-  - required: one of `--input-pdb/--input-dir/--input-quiver/--input-json` and one of `--output-dir/--output-quiver`
-  - used by pipeline: `--input-pdb`, `--output-dir`, `--num-recycles`, `--weights`, `--seed`, `--cautious`, `--hotspot-show-prop`
-
-## Step 2: run phases
-
-Master orchestrator:
-
+Run phases:
 ```bash
 python scripts/run_pipeline.py --phase phase0_smoke
 python scripts/run_pipeline.py --phase phase1_coarse_pilot
@@ -182,421 +186,48 @@ python scripts/run_pipeline.py --phase phase6_cdr1_rescue_main
 python scripts/run_pipeline.py --phase phase9_test1_local_maturation_expand150
 ```
 
-Phase4 custom selected table (recommended when you manually pick 25 from phase3):
-
-```bash
-python scripts/run_pipeline.py \
-  --phase phase4_h2_refine \
-  --execute --resume
-```
-
-Default auto-detect order for Phase4 input CSV:
-- `phase3_selected.csv` (project root)
-- `results/summaries/phase3_selected.csv`
-- `results/summaries/phase3_top25_pre_h2.csv`
-
-You can still override explicitly with `--phase4-input-csv`.
-
-Accepted input shape:
-- full `phase3_top25_pre_h2.csv`, or
-- a custom CSV that at least contains `candidate_id`
-
-When only `candidate_id` is provided, the pipeline auto-fills required columns from
-`phase3_main_campaign/combinations/*/candidates.csv`.
-
-Manual Phase2 combination override (optional):
-- File: `data/configs/phase2_selected_combinations.yaml`
-- If present and `enabled: true`, Phase2 uses `selected_combination_ids` instead of `results/summaries/phase1_top8_combinations.csv`.
-
-Manual Phase3 combination override (optional):
-- File: `data/configs/phase3_selected_combinations.yaml`
-- If present and `enabled: true`, Phase3 uses `selected_combination_ids` instead of `results/summaries/phase2_top2_combinations.csv`.
-
-If your `resolved_targets.yaml` contains relative paths, rerun target prep first so paths are rewritten to absolute:
-
-```bash
-python scripts/prepare_targets.py
-```
-
-When real tool commands are configured, force non-dry execution:
-
-```bash
-python scripts/run_pipeline.py --phase phase1_coarse_pilot --execute
-```
-
-Shell wrappers are also provided:
-
-```bash
-bash scripts/run_phase0.sh
-bash scripts/run_phase1.sh
-bash scripts/run_phase2.sh
-bash scripts/run_phase3.sh
-bash scripts/run_phase4.sh
-bash scripts/run_phase5.sh
-bash scripts/run_phase6.sh
-bash scripts/run_phase9_test1_local_maturation_expand150.sh
-```
-
-### Dry-run and limited debug batch
-
-```bash
-python scripts/run_pipeline.py --phase phase1_coarse_pilot --dry-run
-python scripts/run_pipeline.py --phase phase1_coarse_pilot --dry-run --limit-per-combination 2
-```
-
-### Resume
-
-```bash
-python scripts/run_pipeline.py --phase phase3_main_campaign --resume
-```
-
-Completed tasks are skipped based on checkpoint/status manifests.
-
-## Extra utilities
-
-```bash
-# one-command local bootstrap + smoke
-bash scripts/bootstrap_and_smoke.sh
-
-# detect runtime/tooling/checkpoint fields and unresolved items
-python scripts/autodetect_runtime_and_tooling.py --strict
-
-# regenerate ranking tables from existing phase outputs
-python scripts/parse_and_rank.py --phase phase3_main_campaign
-
-# residue number mapping lookup
-python scripts/map_residue_numbers.py --chain A --full-length-resnum 297
-
-# standalone AF3 export from final table
-python scripts/export_af3_web_package.py
-```
-
-## AF3 results -> RF2 re-score
-
-If you have AF3 web outputs in `AF3 Results/`, you can re-score those structures with RF2:
-
-```bash
-python scripts/rerank_af3_with_rf2.py \
-  --af3-results-dir "AF3 Results" \
-  --tooling-config data/configs/tooling.yaml \
-  --cdr-config data/configs/cdr_boundaries.yaml \
-  --execute
-```
-
-The script automatically converts AF3 models to RF2-compatible HLT-remarked PDBs
-(`H` nanobody + `T` target) and injects `H1/H2/H3` REMARK labels using your CDR config.
-
-Useful options:
-
-- `--model-indices 0` (default): run only AF3 `model_0` per job
-- `--model-indices all`: run all AF3 models found per job
-- `--no-resume`: force rerun even if RF2 JSON already exists
-- `--max-jobs N`: debug with first N jobs
-
-Outputs:
-
-- `results/summaries/af3_rf2_model_level.csv`
-- `results/summaries/af3_rf2_job_summary.csv`
-- `results/summaries/af3_rf2_ranked_designs_vs_wt.csv` (if WT is present)
-
-## Phase plan (exact counts)
-
-- Phase 0:
-  - 1 campaign × 1 H1 length × 1 H3 length
-  - minimal smoke execution
-- Phase 1:
-  - 3 campaigns × 3 H1 × 5 H3 = 45 combinations
-  - 8 backbones per combination
-  - 1 sequence per backbone
-- Phase 2:
-  - top 8 combinations from phase 1
-  - 25 backbones per combination
-  - 2 sequences per backbone
-- Phase 3:
-  - top 2 combinations from phase 2
-  - 150 backbones per combination
-  - 2 sequences per backbone
-  - rank + dedup + select top 25 pre-H2
-- Phase 4:
-  - H2 sequence-only optimization for top 25
-  - keep backbone + H1 + H3 fixed
-  - RF2 filter and keep best H2 variant per candidate
-  - output final top 25
-- Phase 5 (CDR1 rescue pilot):
-  - input parents (fixed):  
-    - `campaign_C_A_plus_pocket_rim_HBGA_adjacent_H113_H311_bb062_s01__H2v03`  
-    - `campaign_C_A_plus_pocket_rim_HBGA_adjacent_H113_H311_bb064_s01__H2v04`
-  - hotspot sets: 3 WT-inspired narrow sets (`Set_1_polar_anchor`, `Set_2_hydrophobic_support`, `Set_3_hybrid_anchor`)
-  - 2 parents × 3 sets × 50 backbones × 1 seq = 300 sequence-level candidates
-  - ranks all 6 parent×hotspot conditions using strict/relaxed pass counts as primary criteria
-- Phase 6 (CDR1 rescue main):
-  - expands best-performing Phase5 condition(s) (default top 1, configurable)
-  - default: 300 backbones × 2 seq = 600 sequence-level candidates
-  - RF2 filtering + sequence de-duplication + near-clonal de-duplication + Final Top25 export
-
-## CDR1 Rescue Increment (Phase5/6)
-
-This repository now includes a targeted post-H2 CDR1 rescue stage (incremental extension, not a restart).
-
-- Goal:
-  - recover WT-like CDR1 interface behavior while preserving previously selected engineered parent contexts
-- Design scope:
-  - only CDR1 positions `26/27/28/30/31/32` are editable in rescue sequence post-processing
-  - H2 and H3 are kept fixed to parent sequences
-  - CDR1 loop length is fixed (no broad loop-length sweep)
-- Hotspot scope:
-  - dedicated WT-inspired narrow hotspot sets are defined in:
-    - `data/configs/cdr1_rescue_hotspots.yaml`
-  - these do **not** overwrite earlier phase hotspot campaigns
-- Parent resolver:
-  - exact parent IDs are read from:
-    - `data/configs/cdr1_rescue_phase.yaml`
-  - and resolved against existing final tables (no generic placeholder renaming)
-
-### Rescue config files
-
-- `data/configs/cdr1_rescue_phase.yaml`
-  - parent candidate IDs
-  - optional exact parent sequence overrides (`phase5.parent_full_sequences`)
-  - editable CDR1 positions
-  - strict/relaxed thresholds
-  - phase5/phase6 design counts
-  - phase6 selection mode (`auto` or manual condition IDs)
-- `data/configs/cdr1_rescue_hotspots.yaml`
-  - 3 WT-inspired CDR1 rescue hotspot sets
-
-### Rescue execution
-
-```bash
-python scripts/run_pipeline.py --phase phase5_cdr1_rescue_pilot --execute --resume
-python scripts/run_pipeline.py --phase phase6_cdr1_rescue_main --execute --resume
-```
-
-Rescue summaries:
-
-```bash
-python scripts/summarize_cdr1_rescue.py
-```
-
-Rescue Final Top25 AF3 handoff output directory:
-
-- `results/af3_web_exports_cdr1_rescue/`
-
-## Test1 Local Maturation (Incremental Next Step)
-
-This repository now also includes a **Test1-centered local maturation** stage for incremental follow-up.
-
-- Parent:
-  - resolved from `Test1` alias to real candidate ID using existing project summaries
-- Branches:
-  - `Branch_A_H1_edge_only` editable positions: `H1:25, H1:26, H1:31, H1:32`
-  - `Branch_B_H1_plus_FR_support` editable positions: `H1:25, H1:26, H1:31, H1:32, FR:35, FR:36, FR:37, FR:39`
-- Fixed residues / scope:
-  - core H1 residues `27/28/29/30/33/34` fixed
-  - H2 fixed, H3 fixed
-  - fixed-backbone local sequence maturation (no broad de novo loop search)
-- Shared hotspot set:
-  - `B75, B217, B219, C122, C124`
-- Evaluation:
-  - RF2-only strict/relaxed filtering
-  - no local AF3 execution (manual AF3 web evaluation later)
-
-Config files:
-
-- `data/configs/test1_local_maturation_phase.yaml`
-- `data/configs/test1_local_maturation_hotspots.yaml`
-
-Run command:
-
-```bash
-python scripts/run_pipeline.py --phase phase_next_test1_local_maturation --execute --resume
-```
-
-Convenience script:
-
-```bash
-bash scripts/run_phase_next_test1_local_maturation.sh --execute --resume
-```
-
-Generated outputs:
-
-- `results/summaries/phase_next_test1_local_maturation_rf2_summary.csv`
-- `results/summaries/phase_next_test1_local_maturation_strict_pass.csv`
-- `results/summaries/phase_next_test1_local_maturation_strict_pass.fasta`
-- `results/summaries/phase_next_test1_local_maturation_summary.md`
-
-## Phase9 Test1 Dual-Branch Expansion150 (Back To Phase7 Conditions)
-
-This repository includes a Phase9 follow-up that reuses the Phase7/Test1 dual-branch setup and only changes scale:
-
-- parent: same Test1 parent resolution and sequence/structure source as `phase_next_test1_local_maturation`
-- branches: same two branches (`Branch_A_H1_edge_only`, `Branch_B_H1_plus_FR_support`)
-- hotspots: same `Test1_defect_guided` set (`B75, B217, B219, C122, C124`)
-- fixed/editable rules: unchanged from Phase7 local maturation
-- scale: `150` candidates per branch (`300` total)
-- evaluation: RF2-only (strict/relaxed), no local AF3
-
-Run command:
-
-```bash
-python scripts/run_pipeline.py --phase phase9_test1_local_maturation_expand150 --execute --resume
-```
-
-Convenience script:
-
-```bash
-bash scripts/run_phase9_test1_local_maturation_expand150.sh --execute --resume
-```
-
-Generated outputs:
-
-- `results/summaries/phase9_test1_local_maturation_expand150_rf2_summary.csv`
-- `results/summaries/phase9_test1_local_maturation_expand150_strict_pass.csv`
-- `results/summaries/phase9_test1_local_maturation_expand150_strict_pass.fasta`
-- `results/summaries/phase9_test1_local_maturation_expand150_summary.md`
-
-## Champion Narrow50 Local Maturation (Phase8 Incremental Follow-up)
-
-This repository also includes a **single-line champion-consensus narrowed local maturation** stage:
-
-- Parent:
-  - preferred: explicit parent sequence mode via `champion_narrow50.parent_full_sequence`
-  - fallback: auto-resolved from Phase7 AF3 ranked summary (`strict 5/5` subset, then ranked by AF3 quality columns)
-  - real parent candidate ID is recorded in outputs/status
-- Scope:
-  - one narrowed line, total `50` candidates (no branching)
-  - fixed-backbone local sequence maturation + RF2 filtering only
-  - no local AF3 execution
-- Fixed positions:
-  - `H1:27, H1:28, H1:29, H1:30, H1:33, H1:34`
-  - H2 fixed, H3 fixed
-- Editable positions:
-  - `H1:25, H1:26, H1:31, FR:37, FR:39`
-- Shared hotspot patch:
-  - `B217, B218, B219, C121, C122, C124`
-
-Config files:
-
-- `data/configs/champion_narrow50_phase.yaml`
-- `data/configs/champion_narrow50_hotspots.yaml`
-
-Run command:
-
-```bash
-python scripts/run_pipeline.py --phase phase_next_champion_narrow50 --execute --resume
-```
-
-Convenience script:
-
-```bash
-bash scripts/run_phase_next_champion_narrow50.sh --execute --resume
-```
-
-Generated outputs:
-
-- `results/summaries/phase_next_champion_narrow50_rf2_summary.csv`
-- `results/summaries/phase_next_champion_narrow50_strict_pass.csv`
-- `results/summaries/phase_next_champion_narrow50_strict_pass.fasta`
-- `results/summaries/phase_next_champion_narrow50_summary.md`
-
-## Filtering and ranking defaults
-
-Hard filters (configurable):
-
-- RF2 pAE < 10
-- design-vs-RF2 RMSD < 2 Å
-
-Ranking priority:
-
-1. RF2 self-consistency
-2. hotspot-region agreement
-3. docking localization consistency
-4. structural plausibility
-5. diversity / de-duplication
-
-## Single-L4 optimization strategy
-
-Implemented runtime controls:
-
-- strict single-GPU mode (`max_gpu_parallel_jobs=1`)
-- split heavy GPU stages from CPU parsing/reporting
-- aggressive reuse of prepared targets and cached stage outputs
-- checkpointed/resume-safe per-combination and per-candidate artifacts
-- dry-run support for debugging without GPU
-- limited-batch mode for pipeline debugging
-
-Expected full run scale with approved settings:
-
-- Phase 1 candidates: 45 × 8 × 1 = 360
-- Phase 2 candidates: 8 × 25 × 2 = 400
-- Phase 3 candidates: 2 × 150 × 2 = 600
-- Phase 4 H2 variants: 25 × configurable (default 4) = 100 RF2 checks
-
-Total expected workload is designed for single-L4 execution with caching and resume support and targeted to remain within approximately <=400 GPU-hours depending on actual RFdiffusion/RF2 throughput and tool configuration.
-
-## AF3 web handoff (manual, external)
-
-No local AF3 is run.
-After phase4, use files in:
-
-- `results/final_25/`
-- `results/af3_web_exports/`
-
-Generated AF3 handoff package includes:
-
-- final 25 FASTA
-- candidate annotation table
-- JSON metadata
-- antigen context references
-
-Then submit manually to AF3 web.
-
-## Required outputs generated by pipeline
-
-- phase-level summary CSVs
-- per-combination pilot summary table
-- top 8 combinations table
-- top 2 combinations table
-- top 25 pre-H2 table
-- final 25 H2-optimized table
-- final metadata JSON
-- final FASTA
-- AF3-web submission spreadsheet
-
-## Tool wrapping policy
-
-This code wraps official RFantibody/RFdiffusion/ProteinMPNN/RF2 commands through configurable wrappers.
-No model internals are reimplemented.
-
-Configure real command prefixes in:
-- `data/configs/tooling.yaml`
-
-Set:
-- `execute_real_tools: true`
-
-before production runs.
-
-## RFdiffusion troubleshooting (important)
-
-If RFdiffusion crashes with errors like:
-- `Non-positive determinant (left-handed or null coordinate frame)`
-
-this is usually caused by alternate-location (`altLoc`) duplicate atoms in PDB inputs (commonly duplicate `CA` records).
-
-This pipeline now sanitizes RFdiffusion inputs automatically by:
-- removing `HETATM`/`ANISOU`
-- keeping altloc ` ` and `A` only
-- de-duplicating `(chain, resnum, icode, atom)` records
-- writing cached `*.rfab_clean.pdb` files next to the original PDBs
-
-If needed, regenerate targets and retry:
-
-```bash
-python scripts/prepare_targets.py
-python scripts/run_pipeline.py --phase phase0_smoke --execute --no-resume
-```
-
-## What you still need to fill in
-
-See:
-- `docs/WHAT_YOU_STILL_NEED_TO_FILL_IN.md`
+Phase shell wrappers are also available in `scripts/run_phase*.sh`.
+
+## Important Analysis / Export Scripts
+Representative downstream utilities included in this repository:
+- `scripts/parse_and_rank.py`
+- `scripts/export_af3_web_package.py`
+- `scripts/generate_af3_batch_json.py`
+- `scripts/rerank_af3_with_rf2.py`
+- `scripts/analyze_af3_interface_stability.py`
+- `scripts/analyze_af3_project_master.py`
+- `scripts/analyze_phase7_phase8_af3_narrow.py`
+- `scripts/analyze_wt_detailed_interactions.py`
+- `scripts/analyze_wt_vs_p9c052_af3.py`
+- `scripts/plot_wt_interaction_modules.py`
+
+These scripts reflect the real workflow that connected the RF2-filtered pipeline to later AF3-based interpretation.
+
+## Recommended Reading Order for New Users
+If you are opening this repository for the first time, the fastest way to understand it is:
+1. read this README
+2. read [`docs/pipeline_stage_summary.md`](docs/pipeline_stage_summary.md)
+3. inspect `data/configs/phases.yaml`
+4. inspect `data/configs/hotspot_campaigns.yaml`
+5. read `scripts/run_pipeline.py`
+6. then inspect the analysis/export scripts relevant to your stage of interest
+
+## Reproducibility Notes
+- This repository preserves the **logic and structure** of the campaign.
+- It does **not** include all raw AF3 folders, VM-only phase outputs, or downloaded model weights.
+- Large run directories and cloud outputs were intentionally excluded to keep the git repository usable.
+- The curated code/config package here is the right starting point for understanding, extending, or documenting the pipeline.
+
+## Companion Repository
+The BIEN225 cellular automaton conversion is maintained separately in:
+- `Noroantibody_AC`
+
+That companion repository packages:
+- the pipeline foundation needed for the course project
+- the CA-ready bridge tables
+- the local 2D time-dependent CA implementation
+
+## Citation-Style Summary
+If you need one sentence for slides or a manuscript draft:
+
+> This repository implements a staged computational nanobody redesign workflow for Norovirus, beginning with hotspot-guided structural exploration and ending with region-focused local maturation logic in which WT remains the stability reference while designed candidates increasingly favor an alternative, CDR1-sensitive interface mode.

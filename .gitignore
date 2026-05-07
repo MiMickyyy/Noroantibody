@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.DS_Store
 .venv/
 .env
 
@@ -11,7 +12,18 @@ phase1_coarse_pilot/
 phase2_focused_pilot/
 phase3_main_campaign/
 phase4_h2_refine/
+phase5_cdr1_rescue_pilot/
+phase6_cdr1_rescue_main/
+phase_next_test1_local_maturation/
+phase_next_champion_narrow50/
+phase9_test1_local_maturation_expand150/
 results/
+AF3 Results/
+ca_noro/
+ca_noro.zip
+*.tar.gz
+*.zip
+vm_shutdown_minimal_*/
 
 # Keep config/templates and source data mapping
 data/raw/
