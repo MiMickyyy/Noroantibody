@@ -381,10 +381,5 @@ That means:
 
 This is intentional. The repository is meant to be deployable and inspectable without becoming unmanageable in size.
 
-## Relationship to `Noroantibody_AC`
-The BIEN225 conversion is maintained separately in `Noroantibody_AC`.
-
-This repository is the structural-design foundation. The CA repository builds on the phase conclusions and selected candidates from this pipeline but is not required to understand or reproduce the pipeline itself.
-
 ## Recommended Citation-Style Summary
 > `Noroantibody` implements a staged computational redesign workflow for a Norovirus nanobody, beginning with hotspot-guided structural exploration and ending with region-focused local maturation in which WT remains the stability reference while designed candidates increasingly favor an alternative, CDR1-sensitive interface mode.
