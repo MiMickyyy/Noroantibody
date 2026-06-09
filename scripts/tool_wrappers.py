@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -63,6 +64,9 @@ class ToolConfig:
     rfdiffusion_weights: Optional[str]
     proteinmpnn_weights: Optional[str]
     rf2_weights: Optional[str]
+    af3score_prefix: List[str]
+    af3score_cwd: Optional[Path]
+    af3score_num_jobs: int
 
 
 def _parse_prefix(value) -> List[str]:
@@ -116,10 +120,12 @@ def load_tool_config(path: Path) -> ToolConfig:
     rfd_tool = merged_tool("rfdiffusion")
     mpnn_tool = merged_tool("proteinmpnn")
     rf2_tool = merged_tool("rf2")
+    af3_tool = merged_tool("af3score")
 
     rfd = _parse_prefix(rfd_tool.get("command_prefix", cfg.get("rfdiffusion", {}).get("command_prefix", [])))
     mpnn = _parse_prefix(mpnn_tool.get("command_prefix", cfg.get("proteinmpnn", {}).get("command_prefix", [])))
     rf2 = _parse_prefix(rf2_tool.get("command_prefix", cfg.get("rf2", {}).get("command_prefix", [])))
+    af3score = _parse_prefix(af3_tool.get("command_prefix", cfg.get("af3score", {}).get("command_prefix", [])))
 
     execute_flag = bool(cfg.get("execute_real_tools", False))
     if not execute_flag:
@@ -149,6 +155,9 @@ def load_tool_config(path: Path) -> ToolConfig:
         rfdiffusion_weights=rfdiff_ckpt,
         proteinmpnn_weights=mpnn_ckpt,
         rf2_weights=rf2_ckpt,
+        af3score_prefix=af3score,
+        af3score_cwd=_parse_optional_cwd(af3_tool.get("run_cwd")),
+        af3score_num_jobs=int(af3_tool.get("num_jobs", cfg.get("af3score", {}).get("num_jobs", 1)) or 1),
     )
 
 
@@ -744,6 +753,173 @@ def run_rf2_filter(
         metrics[f"rf2_score_{key}"] = round(float(value), 4)
 
     out_json.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    return metrics
+
+
+def _safe_float(value, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _round_or_blank(value: Optional[float], ndigits: int = 4):
+    if value is None:
+        return ""
+    return round(float(value), ndigits)
+
+
+def _safe_af3score_stem(candidate_id: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(candidate_id).strip().lower())
+    token = re.sub(r"_+", "_", token).strip("._-")
+    return token or "candidate"
+
+
+def _mean_numeric_columns(row: dict, suffix: str) -> Optional[float]:
+    vals = []
+    for key, value in row.items():
+        if not str(key).endswith(suffix):
+            continue
+        parsed = _safe_float(value)
+        if parsed is not None:
+            vals.append(parsed)
+    if not vals:
+        return None
+    return float(sum(vals) / len(vals))
+
+
+def _max_numeric_prefix(row: dict, prefix: str) -> Optional[float]:
+    vals = []
+    for key, value in row.items():
+        if not str(key).startswith(prefix):
+            continue
+        parsed = _safe_float(value)
+        if parsed is not None:
+            vals.append(parsed)
+    if not vals:
+        return None
+    return float(max(vals))
+
+
+def _af3score_rank_value(metrics: dict) -> float:
+    ptm = float(metrics.get("af3score_ptm") or 0.0)
+    iptm = float(metrics.get("af3score_iptm") or 0.0)
+    plddt = float(metrics.get("af3score_plddt") or 0.0)
+    pae = _safe_float(metrics.get("af3score_pae"))
+    ipsae = float(metrics.get("af3score_ipsae") or 0.0)
+    plddt_term = max(0.0, min(1.0, plddt / 100.0))
+    pae_term = 0.0 if pae is None else max(0.0, min(1.0, 1.0 - pae / 30.0))
+    ipsae_term = max(0.0, min(1.0, ipsae))
+    return float(0.30 * iptm + 0.20 * ptm + 0.20 * plddt_term + 0.15 * pae_term + 0.15 * ipsae_term)
+
+
+def _parse_af3score_metric_csv(metrics_csv: Path, expected_description: str) -> dict:
+    if not metrics_csv.exists():
+        raise PipelineError(f"AF3Score metrics CSV missing: {metrics_csv}")
+
+    with metrics_csv.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise PipelineError(f"AF3Score metrics CSV is empty: {metrics_csv}")
+
+    row = None
+    for candidate in rows:
+        if str(candidate.get("description", "")).strip() == expected_description:
+            row = candidate
+            break
+    if row is None:
+        row = rows[0]
+
+    metrics = {
+        "af3score_status": "completed",
+        "af3score_description": row.get("description", expected_description),
+        "af3score_metric_csv": str(metrics_csv),
+        "af3score_ptm": _round_or_blank(_safe_float(row.get("ptm"))),
+        "af3score_iptm": _round_or_blank(_safe_float(row.get("iptm"))),
+        "af3score_plddt": _round_or_blank(_mean_numeric_columns(row, "_plddt")),
+        "af3score_pae": _round_or_blank(_mean_numeric_columns(row, "_pae")),
+        "af3score_ipsae": _round_or_blank(_max_numeric_prefix(row, "ipsae_")),
+    }
+    metrics["af3score_rank_score"] = round(_af3score_rank_value(metrics), 6)
+    return metrics
+
+
+def run_af3score_filter(
+    cfg: ToolConfig,
+    input_pdb: Path,
+    out_dir: Path,
+    dry_run: bool,
+    log_file: Path,
+    seed: int,
+    context: dict,
+) -> dict:
+    """Run AF3Score validation for one RF2-relaxed candidate."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    candidate_id = str(context.get("candidate_id", input_pdb.stem))
+    safe_stem = _safe_af3score_stem(candidate_id)
+    input_dir = out_dir / "input_pdb"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    input_copy = input_dir / f"{safe_stem}.pdb"
+    metrics_csv = out_dir / "af3score_metrics.csv"
+    metrics_json = out_dir / f"{safe_stem}_af3score.json"
+
+    if dry_run or not cfg.execute_real_tools:
+        rng = deterministic_rng(seed, f"af3score::{candidate_id}")
+        rf2_pae = float(context.get("rf2_pae", 12.0) or 12.0)
+        rf2_rmsd = float(context.get("design_rf2_rmsd", 2.5) or 2.5)
+        rf2_quality = max(0.0, min(1.0, 1.0 - (rf2_pae / 18.0 + rf2_rmsd / 4.0) / 2.0))
+        ptm = max(0.45, min(0.95, 0.58 + 0.28 * rf2_quality + rng.uniform(-0.04, 0.04)))
+        iptm = max(0.35, min(0.92, 0.50 + 0.32 * rf2_quality + rng.uniform(-0.05, 0.05)))
+        plddt = max(55.0, min(95.0, 67.0 + 22.0 * rf2_quality + rng.uniform(-4.0, 4.0)))
+        pae = max(3.0, min(22.0, 17.0 - 10.0 * rf2_quality + rng.uniform(-1.5, 1.5)))
+        ipsae = max(0.0, min(1.0, 0.35 + 0.45 * rf2_quality + rng.uniform(-0.06, 0.06)))
+
+        input_copy.write_text(
+            input_pdb.read_text(encoding="utf-8", errors="ignore") if input_pdb.exists() else "",
+            encoding="utf-8",
+        )
+        with metrics_csv.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["description", "ptm", "iptm", "chain_A_plddt", "chain_A_pae", "ipsae_A_B"],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "description": safe_stem,
+                    "ptm": round(ptm, 4),
+                    "iptm": round(iptm, 4),
+                    "chain_A_plddt": round(plddt, 4),
+                    "chain_A_pae": round(pae, 4),
+                    "ipsae_A_B": round(ipsae, 4),
+                }
+            )
+        metrics = _parse_af3score_metric_csv(metrics_csv, safe_stem)
+        metrics["af3score_status"] = "dry_run"
+        metrics["af3score_input_pdb"] = str(input_copy)
+        metrics["af3score_output_dir"] = str(out_dir)
+        metrics_json.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        return metrics
+
+    if not cfg.af3score_prefix:
+        raise PipelineError(
+            "AF3Score is enabled for RF2-relaxed candidates but af3score.command_prefix is empty."
+        )
+    if not input_pdb.exists():
+        raise PipelineError(f"AF3Score input PDB missing: {input_pdb}")
+
+    shutil.copyfile(input_pdb, input_copy)
+    cmd = list(cfg.af3score_prefix) + [str(input_dir), str(out_dir), str(max(1, int(cfg.af3score_num_jobs)))]
+    code = run_command(cmd, log_path=log_file, dry_run=False, cwd=cfg.af3score_cwd)
+    if code != 0:
+        raise PipelineError(f"AF3Score command failed for {candidate_id}; see {log_file}")
+
+    metrics = _parse_af3score_metric_csv(metrics_csv, safe_stem)
+    metrics["af3score_input_pdb"] = str(input_copy)
+    metrics["af3score_output_dir"] = str(out_dir)
+    metrics_json.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics
 
 

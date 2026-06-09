@@ -35,12 +35,29 @@ filters:
   hard_thresholds:
     rf2_pae_max: 10.0
     design_rf2_rmsd_max: 2.0
+  relaxed_thresholds:
+    rf2_pae_max: 12.0
+    design_rf2_rmsd_max: 2.5
   ranking_weights:
     rf2_self_consistency: 0.40
     hotspot_agreement: 0.25
     docking_localization: 0.20
     structural_plausibility: 0.10
     h1_h3_role_consistency: 0.05
+
+af3score:
+  enabled: true
+  score_relaxed_only: true
+  ranking_weights:
+    rf2: 0.60
+    af3score: 0.40
+  validation_thresholds:
+    ptm_min:
+    iptm_min:
+    plddt_min:
+    pae_max:
+    ipsae_min:
+    rank_score_min:
 
 postprocess:
   sequence_dedup_identity_threshold: 0.95

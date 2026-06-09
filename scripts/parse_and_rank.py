@@ -12,6 +12,32 @@ from pipeline_common import PipelineError, atomic_write_csv, greedy_sequence_ded
 from tool_wrappers import combine_weighted_score
 
 
+AF3SCORE_FIELDS = [
+    "rf2_relaxed_pass",
+    "af3score_status",
+    "af3score_validation_pass",
+    "af3score_ptm",
+    "af3score_iptm",
+    "af3score_plddt",
+    "af3score_pae",
+    "af3score_ipsae",
+    "af3score_rank_score",
+    "combined_ranking_score",
+    "af3score_metric_csv",
+    "af3score_input_pdb",
+    "af3score_output_dir",
+]
+
+
+def ensure_combined_score_column(df: pd.DataFrame) -> pd.DataFrame:
+    ranking = pd.to_numeric(df["ranking_score"], errors="coerce").fillna(0.0)
+    if "combined_ranking_score" not in df.columns:
+        df["combined_ranking_score"] = ranking
+    else:
+        df["combined_ranking_score"] = pd.to_numeric(df["combined_ranking_score"], errors="coerce").fillna(ranking)
+    return df
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Re-parse and rank candidate outputs by phase.")
     parser.add_argument("--phase", required=True, choices=["phase1_coarse_pilot", "phase2_focused_pilot", "phase3_main_campaign"])
@@ -68,6 +94,7 @@ def main() -> int:
             )
         )
     df["ranking_score"] = scores
+    ensure_combined_score_column(df)
 
     summary = (
         df.groupby(["combination_id", "campaign_name", "h1_length", "h3_length"], as_index=False)
@@ -76,8 +103,13 @@ def main() -> int:
             hard_pass_candidates=("hard_filter_pass", "sum"),
             best_ranking_score=("ranking_score", "max"),
             mean_ranking_score=("ranking_score", "mean"),
+            best_combined_ranking_score=("combined_ranking_score", "max"),
+            mean_combined_ranking_score=("combined_ranking_score", "mean"),
         )
-        .sort_values(["hard_pass_candidates", "best_ranking_score", "mean_ranking_score"], ascending=False)
+        .sort_values(
+            ["hard_pass_candidates", "best_combined_ranking_score", "mean_combined_ranking_score"],
+            ascending=False,
+        )
     )
 
     out_summary = root / "results/summaries" / f"{args.phase}_summary_reparsed.csv"
@@ -100,14 +132,22 @@ def main() -> int:
         deduped = greedy_sequence_dedup(
             rows=rows,
             sequence_key="full_sequence",
-            score_key="ranking_score",
+            score_key="combined_ranking_score",
             identity_threshold=float(pipeline_cfg.get("postprocess", {}).get("sequence_dedup_identity_threshold", 0.95)),
         )
-        top = sorted(deduped, key=lambda x: float(x.get("ranking_score", 0.0)), reverse=True)[: int(args.top_candidates)]
+        top = sorted(
+            deduped,
+            key=lambda x: float(x.get("combined_ranking_score", x.get("ranking_score", 0.0)) or 0.0),
+            reverse=True,
+        )[: int(args.top_candidates)]
+        fields = list(df.columns)
+        for field in AF3SCORE_FIELDS:
+            if field not in fields:
+                fields.append(field)
         atomic_write_csv(
             root / "results/summaries/phase3_top25_pre_h2.csv",
             top,
-            list(df.columns),
+            fields,
         )
 
     print(f"Re-parsing complete: {out_summary}")

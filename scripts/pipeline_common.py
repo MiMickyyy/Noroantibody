@@ -162,7 +162,17 @@ def greedy_sequence_dedup(
 ) -> List[dict]:
     if not rows:
         return []
-    rows_sorted = sorted(rows, key=lambda x: float(x.get(score_key, 0.0)), reverse=True)
+
+    def score_value(row: dict) -> float:
+        try:
+            value = row.get(score_key, 0.0)
+            if value is None or str(value).strip() == "":
+                return 0.0
+            return float(value)
+        except Exception:
+            return 0.0
+
+    rows_sorted = sorted(rows, key=score_value, reverse=True)
     keep: List[dict] = []
     aligner = PairwiseAligner(mode="global")
     aligner.match_score = 1.0

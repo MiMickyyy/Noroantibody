@@ -15,6 +15,12 @@ rf2:
   run_cwd: ""
   notes: "Autodetect script will resolve real command prefix if available."
 
+af3score:
+  command_prefix: "AUTO_DETECT_FROM_REPO_AND_ENV"
+  run_cwd: ""
+  num_jobs: 1
+  notes: "Set to a list such as ['bash', 'external/AF3Score/AF3score_pipeline.sh'] after AF3Score is installed/configured."
+
 checkpoints:
   rfdiffusion_weights: "AUTO_DETECT_FROM_REPO_AND_ENV"
   proteinmpnn_weights: "AUTO_DETECT_FROM_REPO_AND_ENV"

@@ -39,6 +39,7 @@ from tool_wrappers import (
     load_tool_config,
     mutate_h2_only,
     random_loop,
+    run_af3score_filter,
     run_proteinmpnn_sequence_design,
     run_rfdiffusion_backbone,
     run_rf2_filter,
@@ -777,6 +778,165 @@ def hard_pass(metrics: dict, filter_cfg: dict) -> bool:
     return float(metrics.get("rf2_pae", 99.0)) < pae_max and float(metrics.get("design_rf2_rmsd", 99.0)) < rmsd_max
 
 
+AF3SCORE_FIELDS = [
+    "rf2_relaxed_pass",
+    "af3score_status",
+    "af3score_validation_pass",
+    "af3score_ptm",
+    "af3score_iptm",
+    "af3score_plddt",
+    "af3score_pae",
+    "af3score_ipsae",
+    "af3score_rank_score",
+    "combined_ranking_score",
+    "af3score_metric_csv",
+    "af3score_input_pdb",
+    "af3score_output_dir",
+]
+
+
+def relaxed_surrogate_pass(metrics: dict, filter_cfg: dict) -> bool:
+    th = filter_cfg.get("relaxed_thresholds", {})
+    if not th:
+        th = {"rf2_pae_max": 12.0, "design_rf2_rmsd_max": 2.5}
+    pae_max = float(th.get("rf2_pae_max", 12.0))
+    rmsd_max = float(th.get("design_rf2_rmsd_max", 2.5))
+    return float(metrics.get("rf2_pae", 99.0)) < pae_max and float(metrics.get("design_rf2_rmsd", 99.0)) < rmsd_max
+
+
+def blank_af3score_fields(
+    rf2_relaxed_pass: int,
+    ranking_score: float,
+    status: str,
+) -> dict:
+    return {
+        "rf2_relaxed_pass": int(rf2_relaxed_pass),
+        "af3score_status": status,
+        "af3score_validation_pass": 0,
+        "af3score_ptm": "",
+        "af3score_iptm": "",
+        "af3score_plddt": "",
+        "af3score_pae": "",
+        "af3score_ipsae": "",
+        "af3score_rank_score": "",
+        "combined_ranking_score": round(float(ranking_score), 6),
+        "af3score_metric_csv": "",
+        "af3score_input_pdb": "",
+        "af3score_output_dir": "",
+    }
+
+
+def af3score_validation_pass(metrics: dict, af3_cfg: dict) -> int:
+    if str(metrics.get("af3score_status", "")).strip() not in {"completed", "dry_run"}:
+        return 0
+    thresholds = af3_cfg.get("validation_thresholds", {}) or {}
+    checks = [
+        ("af3score_ptm", "ptm_min", "min"),
+        ("af3score_iptm", "iptm_min", "min"),
+        ("af3score_plddt", "plddt_min", "min"),
+        ("af3score_ipsae", "ipsae_min", "min"),
+        ("af3score_pae", "pae_max", "max"),
+        ("af3score_rank_score", "rank_score_min", "min"),
+    ]
+    for metric_key, threshold_key, mode in checks:
+        raw_threshold = thresholds.get(threshold_key)
+        if raw_threshold in (None, ""):
+            continue
+        threshold = _safe_float(raw_threshold, float("nan"))
+        value = _safe_float(metrics.get(metric_key), float("nan"))
+        if math.isnan(threshold) or math.isnan(value):
+            return 0
+        if mode == "min" and value < threshold:
+            return 0
+        if mode == "max" and value > threshold:
+            return 0
+    return 1
+
+
+def maybe_run_af3score_validation(
+    *,
+    context: dict,
+    args: argparse.Namespace,
+    phase_name: str,
+    candidate_id: str,
+    rf2_input_pdb: Path,
+    metrics: dict,
+    ranking_score: float,
+    rf2_relaxed_pass: bool,
+    scope_dir: Path,
+    logs_dir: Path,
+    seed_base: int,
+) -> dict:
+    pipeline_cfg = context["pipeline_cfg"]
+    af3_cfg = pipeline_cfg.get("af3score", {}) or {}
+    enabled = bool(af3_cfg.get("enabled", False))
+    relaxed_only = bool(af3_cfg.get("score_relaxed_only", True))
+    relaxed_int = int(bool(rf2_relaxed_pass))
+
+    if not enabled:
+        return blank_af3score_fields(relaxed_int, ranking_score, "disabled")
+    if relaxed_only and not rf2_relaxed_pass:
+        return blank_af3score_fields(relaxed_int, ranking_score, "skipped_rf2_relaxed_gate")
+
+    af3_input = Path(str(metrics.get("rf2_best_pdb") or rf2_input_pdb))
+    af3_metrics = run_af3score_filter(
+        cfg=context["tool_cfg"],
+        input_pdb=af3_input,
+        out_dir=scope_dir / "af3score" / slugify(candidate_id),
+        dry_run=args.dry_run,
+        log_file=logs_dir / f"{slugify(candidate_id)}_af3score.log",
+        seed=seed_base,
+        context={
+            "candidate_id": candidate_id,
+            "phase": phase_name,
+            "rf2_pae": metrics.get("rf2_pae", ""),
+            "design_rf2_rmsd": metrics.get("design_rf2_rmsd", metrics.get("design_vs_rf2_rmsd", "")),
+        },
+    )
+    af3_metrics["rf2_relaxed_pass"] = relaxed_int
+    af3_metrics["af3score_validation_pass"] = af3score_validation_pass(af3_metrics, af3_cfg)
+
+    af3_rank = _safe_float(af3_metrics.get("af3score_rank_score"), float("nan"))
+    if math.isnan(af3_rank):
+        af3_metrics["combined_ranking_score"] = round(float(ranking_score), 6)
+        return {key: af3_metrics.get(key, "") for key in AF3SCORE_FIELDS}
+
+    weights = af3_cfg.get("ranking_weights", {}) or {}
+    rf2_weight = float(weights.get("rf2", 0.6))
+    af3_weight = float(weights.get("af3score", 0.4))
+    denom = rf2_weight + af3_weight
+    if denom <= 0:
+        rf2_weight, af3_weight, denom = 1.0, 0.0, 1.0
+    combined = (rf2_weight * float(ranking_score) + af3_weight * af3_rank) / denom
+    af3_metrics["combined_ranking_score"] = round(float(combined), 6)
+    return {key: af3_metrics.get(key, "") for key in AF3SCORE_FIELDS}
+
+
+def combined_score(row: dict, default: float = 0.0) -> float:
+    value = _safe_float(row.get("combined_ranking_score"), float("nan"))
+    if math.isnan(value):
+        return _safe_float(row.get("ranking_score"), default)
+    return value
+
+
+def ensure_combined_scores(rows: List[dict]) -> List[dict]:
+    for row in rows:
+        if math.isnan(_safe_float(row.get("combined_ranking_score"), float("nan"))):
+            row["combined_ranking_score"] = row.get("ranking_score", 0.0)
+    return rows
+
+
+def ensure_combined_score_column(df: pd.DataFrame, ranking_col: str = "ranking_score") -> pd.DataFrame:
+    if ranking_col not in df.columns:
+        return df
+    ranking = pd.to_numeric(df[ranking_col], errors="coerce").fillna(0.0)
+    if "combined_ranking_score" not in df.columns:
+        df["combined_ranking_score"] = ranking
+    else:
+        df["combined_ranking_score"] = pd.to_numeric(df["combined_ranking_score"], errors="coerce").fillna(ranking)
+    return df
+
+
 def load_or_empty_csv(path: Path) -> List[dict]:
     if not path.exists():
         return []
@@ -1320,7 +1480,7 @@ def rank_phase5_rescue_conditions(condition_rows: List[dict], top_k: int) -> Tup
         key=lambda x: (
             int(x.get("strict_pass_count", 0)),
             int(x.get("relaxed_pass_count", 0)),
-            float(x.get("mean_ranking_score", 0.0)),
+            float(x.get("mean_combined_ranking_score", x.get("mean_ranking_score", 0.0)) or 0.0),
             -float(x.get("mean_design_rf2_rmsd", 999.0)),
             -float(x.get("mean_rf2_pae", 999.0)),
         ),
@@ -1363,6 +1523,11 @@ def export_af3_handoff_custom(context: dict, final_rows: List[dict], outdir: Pat
                 "strict_pass": r.get("strict_pass", ""),
                 "relaxed_pass": r.get("relaxed_pass", ""),
                 "ranking_score": r.get("ranking_score", ""),
+                "combined_ranking_score": r.get("combined_ranking_score", r.get("ranking_score", "")),
+                "af3score_status": r.get("af3score_status", ""),
+                "af3score_validation_pass": r.get("af3score_validation_pass", ""),
+                "af3score_rank_score": r.get("af3score_rank_score", ""),
+                "af3score_metric_csv": r.get("af3score_metric_csv", ""),
                 "rf2_best_pdb": r.get("rf2_best_pdb", ""),
                 "notes": r.get("warning", ""),
             }
@@ -1384,6 +1549,11 @@ def export_af3_handoff_custom(context: dict, final_rows: List[dict], outdir: Pat
             "strict_pass",
             "relaxed_pass",
             "ranking_score",
+            "combined_ranking_score",
+            "af3score_status",
+            "af3score_validation_pass",
+            "af3score_rank_score",
+            "af3score_metric_csv",
             "rf2_best_pdb",
             "notes",
         ],
@@ -1667,6 +1837,19 @@ def run_cdr1_rescue_design(
                     strict_cfg=strict_cfg,
                     relaxed_cfg=relaxed_cfg,
                 )
+                af3score_fields = maybe_run_af3score_validation(
+                    context=context,
+                    args=args,
+                    phase_name=phase_name,
+                    candidate_id=cid,
+                    rf2_input_pdb=threaded_pdb,
+                    metrics=metrics,
+                    ranking_score=score,
+                    rf2_relaxed_pass=bool(relaxed_pass),
+                    scope_dir=cdir,
+                    logs_dir=logs_dir,
+                    seed_base=seed_base,
+                )
                 warning_parts: List[str] = []
                 if mask_warning:
                     warning_parts.append(mask_warning)
@@ -1688,47 +1871,47 @@ def run_cdr1_rescue_design(
                     h2_seq_c = cond.parent_h2_sequence
                     h3_seq_c = cond.parent_h3_sequence
 
-                candidates.append(
-                    {
-                        "phase": phase_name,
-                        "condition_id": cond.condition_id,
-                        "phase_condition_id": cond.phase_condition_id,
-                        "parent_candidate_id": cond.parent_candidate_id,
-                        "parent_combination_id": cond.parent_combination_id,
-                        "parent_campaign_name": cond.parent_campaign_name,
-                        "hotspot_set_name": cond.hotspot_set_name,
-                        "hotspot_residues": ",".join(str(x) for x in cond.hotspot_residues),
-                        "editable_cdr1_positions": ",".join(str(x) for x in editable_positions),
-                        "backbone_id": bb_id,
-                        "backbone_pdb": str(bb_pdb),
-                        "backbone_signature": cell_to_str(bb.get("backbone_signature")),
-                        "candidate_id": cid,
-                        "threaded_pdb": str(threaded_pdb),
-                        "rf2_best_pdb": str(metrics.get("rf2_best_pdb", "")),
-                        "h1_sequence": h1_seq_c,
-                        "h2_sequence": h2_seq_c,
-                        "h3_sequence": h3_seq_c,
-                        "full_sequence": constrained_seq,
-                        "strict_pass": strict_pass,
-                        "relaxed_pass": relaxed_pass,
-                        "hard_filter_pass": strict_pass,
-                        "rf2_pae": metrics.get("rf2_pae", ""),
-                        "design_rf2_rmsd": metrics.get("design_rf2_rmsd", ""),
-                        "hotspot_agreement": metrics.get("hotspot_agreement", ""),
-                        "groove_localization": metrics.get("groove_localization", ""),
-                        "h1_h3_role_consistency": metrics.get("h1_h3_role_consistency", ""),
-                        "structural_plausibility": metrics.get("structural_plausibility", ""),
-                        "target_contact_residue_count": metrics.get("target_contact_residue_count", ""),
-                        "hotspot_overlap_count": metrics.get("hotspot_overlap_count", ""),
-                        "ranking_score": round(float(score), 6),
-                        "cdr1_edit_count": len(edited_pos),
-                        "cdr1_edited_positions": ",".join(str(x) for x in edited_pos),
-                        "cdr1_rescue_stable_interacting_positions_count": "",
-                        "cdr1_rescue_wt_anchor_overlap_count": "",
-                        "cdr1_rescue_hotspot_enrichment_score": "",
-                        "warning": warning,
-                    }
-                )
+                candidate_row = {
+                    "phase": phase_name,
+                    "condition_id": cond.condition_id,
+                    "phase_condition_id": cond.phase_condition_id,
+                    "parent_candidate_id": cond.parent_candidate_id,
+                    "parent_combination_id": cond.parent_combination_id,
+                    "parent_campaign_name": cond.parent_campaign_name,
+                    "hotspot_set_name": cond.hotspot_set_name,
+                    "hotspot_residues": ",".join(str(x) for x in cond.hotspot_residues),
+                    "editable_cdr1_positions": ",".join(str(x) for x in editable_positions),
+                    "backbone_id": bb_id,
+                    "backbone_pdb": str(bb_pdb),
+                    "backbone_signature": cell_to_str(bb.get("backbone_signature")),
+                    "candidate_id": cid,
+                    "threaded_pdb": str(threaded_pdb),
+                    "rf2_best_pdb": str(metrics.get("rf2_best_pdb", "")),
+                    "h1_sequence": h1_seq_c,
+                    "h2_sequence": h2_seq_c,
+                    "h3_sequence": h3_seq_c,
+                    "full_sequence": constrained_seq,
+                    "strict_pass": strict_pass,
+                    "relaxed_pass": relaxed_pass,
+                    "hard_filter_pass": strict_pass,
+                    "rf2_pae": metrics.get("rf2_pae", ""),
+                    "design_rf2_rmsd": metrics.get("design_rf2_rmsd", ""),
+                    "hotspot_agreement": metrics.get("hotspot_agreement", ""),
+                    "groove_localization": metrics.get("groove_localization", ""),
+                    "h1_h3_role_consistency": metrics.get("h1_h3_role_consistency", ""),
+                    "structural_plausibility": metrics.get("structural_plausibility", ""),
+                    "target_contact_residue_count": metrics.get("target_contact_residue_count", ""),
+                    "hotspot_overlap_count": metrics.get("hotspot_overlap_count", ""),
+                    "ranking_score": round(float(score), 6),
+                    "cdr1_edit_count": len(edited_pos),
+                    "cdr1_edited_positions": ",".join(str(x) for x in edited_pos),
+                    "cdr1_rescue_stable_interacting_positions_count": "",
+                    "cdr1_rescue_wt_anchor_overlap_count": "",
+                    "cdr1_rescue_hotspot_enrichment_score": "",
+                    "warning": warning,
+                }
+                candidate_row.update(af3score_fields)
+                candidates.append(candidate_row)
                 existing_candidate_ids.add(cid)
 
         candidate_fields = [
@@ -1763,6 +1946,7 @@ def run_cdr1_rescue_design(
             "target_contact_residue_count",
             "hotspot_overlap_count",
             "ranking_score",
+            *AF3SCORE_FIELDS,
             "cdr1_edit_count",
             "cdr1_edited_positions",
             "cdr1_rescue_stable_interacting_positions_count",
@@ -1784,9 +1968,13 @@ def run_cdr1_rescue_design(
                 "total_designs": 0,
                 "strict_pass_count": 0,
                 "relaxed_pass_count": 0,
+                "af3score_scored_count": 0,
+                "af3score_validation_pass_count": 0,
                 "strict_pass_rate": 0.0,
                 "relaxed_pass_rate": 0.0,
                 "mean_ranking_score": 0.0,
+                "mean_combined_ranking_score": 0.0,
+                "mean_af3score_rank_score": 0.0,
                 "mean_rf2_pae": 0.0,
                 "mean_design_rf2_rmsd": 0.0,
                 "unique_sequence_count": 0,
@@ -1796,9 +1984,11 @@ def run_cdr1_rescue_design(
                 "cdr1_rescue_hotspot_enrichment_score": "",
             }
         else:
+            ensure_combined_score_column(df)
             total = int(df.shape[0])
             strict_count = int(df["strict_pass"].astype(int).sum())
             relaxed_count = int(df["relaxed_pass"].astype(int).sum())
+            af3_rank_series = pd.to_numeric(df.get("af3score_rank_score", 0), errors="coerce")
             summary = {
                 "phase": phase_name,
                 "condition_id": cond.condition_id,
@@ -1809,9 +1999,13 @@ def run_cdr1_rescue_design(
                 "total_designs": total,
                 "strict_pass_count": strict_count,
                 "relaxed_pass_count": relaxed_count,
+                "af3score_scored_count": int(df["af3score_status"].isin(["completed", "dry_run"]).sum()) if "af3score_status" in df.columns else 0,
+                "af3score_validation_pass_count": int(pd.to_numeric(df.get("af3score_validation_pass", 0), errors="coerce").fillna(0).sum()),
                 "strict_pass_rate": round(strict_count / max(1, total), 4),
                 "relaxed_pass_rate": round(relaxed_count / max(1, total), 4),
                 "mean_ranking_score": float(df["ranking_score"].astype(float).mean()),
+                "mean_combined_ranking_score": float(df["combined_ranking_score"].mean()),
+                "mean_af3score_rank_score": float(af3_rank_series.dropna().mean()) if af3_rank_series.notna().any() else 0.0,
                 "mean_rf2_pae": float(df["rf2_pae"].astype(float).mean()),
                 "mean_design_rf2_rmsd": float(df["design_rf2_rmsd"].astype(float).mean()),
                 "unique_sequence_count": int(df["full_sequence"].nunique()),
@@ -2035,6 +2229,7 @@ def run_phase6_cdr1_rescue_main(context: dict, args: argparse.Namespace):
     df["ranking_score"] = df["ranking_score"].astype(float)
     df["rf2_pae"] = df["rf2_pae"].astype(float)
     df["design_rf2_rmsd"] = df["design_rf2_rmsd"].astype(float)
+    ensure_combined_score_column(df)
     df["rf2_sum_score"] = df["rf2_pae"] + df["design_rf2_rmsd"]
     # Phase6 RF2-only ranking: normalize first, then aggregate.
     # Requested normalization: RMSD/10, pAE/2; lower combined score is better.
@@ -2054,10 +2249,10 @@ def run_phase6_cdr1_rescue_main(context: dict, args: argparse.Namespace):
         ranked_df["dedup_score"] = -ranked_df["rf2_norm_score"]
     else:
         ranked_df = df.sort_values(
-            ["strict_pass", "relaxed_pass", "ranking_score", "design_rf2_rmsd", "rf2_pae"],
-            ascending=[False, False, False, True, True],
+            ["strict_pass", "relaxed_pass", "combined_ranking_score", "ranking_score", "design_rf2_rmsd", "rf2_pae"],
+            ascending=[False, False, False, False, True, True],
         )
-        ranked_df["dedup_score"] = ranked_df["ranking_score"]
+        ranked_df["dedup_score"] = ranked_df["combined_ranking_score"]
     ranked_df = ranked_df.drop_duplicates(subset=["full_sequence"], keep="first")
 
     dedup_threshold = float(rescue_cfg.get("cdr1_rescue", {}).get("dedup_identity_threshold", 0.95))
@@ -2084,6 +2279,7 @@ def run_phase6_cdr1_rescue_main(context: dict, args: argparse.Namespace):
             key=lambda x: (
                 int(x.get("strict_pass", 0)),
                 int(x.get("relaxed_pass", 0)),
+                combined_score(x),
                 float(x.get("ranking_score", 0.0)),
                 -float(x.get("design_rf2_rmsd", 999.0)),
                 -float(x.get("rf2_pae", 999.0)),
@@ -2093,7 +2289,7 @@ def run_phase6_cdr1_rescue_main(context: dict, args: argparse.Namespace):
 
     for idx, row in enumerate(final_ranked, 1):
         row["phase6_rank"] = idx
-        row["phase6_ranking_mode"] = "rf2_norm_sum" if use_rf2_sum_mode else "strict_then_ranking"
+        row["phase6_ranking_mode"] = "rf2_norm_sum" if use_rf2_sum_mode else "strict_then_combined"
     top_n = int(phase6_cfg.get("final_top_n", context["pipeline_cfg"].get("af3_handoff", {}).get("export_top_n", 25)))
     top_rows = final_ranked[:top_n]
     top_label = f"final{top_n}"
@@ -3079,37 +3275,50 @@ def run_phase_next_test1_local_maturation(
                 strict_cfg=strict_cfg,
                 relaxed_cfg=relaxed_cfg,
             )
+            af3score_fields = maybe_run_af3score_validation(
+                context=context,
+                args=args,
+                phase_name=phase_name,
+                candidate_id=cid,
+                rf2_input_pdb=threaded_pdb,
+                metrics=metrics,
+                ranking_score=ranking_score,
+                rf2_relaxed_pass=bool(relaxed_pass),
+                scope_dir=bdir,
+                logs_dir=logs_dir,
+                seed_base=seed_base,
+            )
 
             if threading_warning:
                 warning_parts.append(threading_warning)
             warning = " | ".join(warning_parts)
 
-            candidates.append(
-                {
-                    "phase": phase_name,
-                    "branch_name": branch.branch_name,
-                    "phase_branch_id": branch.phase_branch_id,
-                    "parent_candidate_id": parent["candidate_id"],
-                    "parent_candidate_ref": parent_ref,
-                    "parent_alias_source": parent["alias_source"],
-                    "candidate_id": cid,
-                    "editable_positions": ",".join(str(x) for x in branch.editable_positions),
-                    "fixed_core_positions": ",".join(str(x) for x in fixed_core_positions),
-                    "hotspot_set_name": hotspot_set["set_name"],
-                    "hotspot_tokens": ",".join(hotspot_set["tokens"]),
-                    "full_sequence": final_seq,
-                    "strict_pass": int(strict_pass),
-                    "relaxed_pass": int(relaxed_pass),
-                    "rf2_pae": _safe_float(metrics.get("rf2_pae"), 99.0),
-                    "design_vs_rf2_rmsd": _safe_float(metrics.get("design_rf2_rmsd"), 99.0),
-                    "ranking_score": ranking_score,
-                    "threaded_pdb": str(threaded_pdb),
-                    "rf2_best_pdb": str(metrics.get("rf2_best_pdb", "")),
-                    "cdr1_edit_count": len(edited_pos),
-                    "cdr1_edited_positions": ",".join(str(x) for x in sorted(set(edited_pos))),
-                    "warning": warning,
-                }
-            )
+            candidate_row = {
+                "phase": phase_name,
+                "branch_name": branch.branch_name,
+                "phase_branch_id": branch.phase_branch_id,
+                "parent_candidate_id": parent["candidate_id"],
+                "parent_candidate_ref": parent_ref,
+                "parent_alias_source": parent["alias_source"],
+                "candidate_id": cid,
+                "editable_positions": ",".join(str(x) for x in branch.editable_positions),
+                "fixed_core_positions": ",".join(str(x) for x in fixed_core_positions),
+                "hotspot_set_name": hotspot_set["set_name"],
+                "hotspot_tokens": ",".join(hotspot_set["tokens"]),
+                "full_sequence": final_seq,
+                "strict_pass": int(strict_pass),
+                "relaxed_pass": int(relaxed_pass),
+                "rf2_pae": _safe_float(metrics.get("rf2_pae"), 99.0),
+                "design_vs_rf2_rmsd": _safe_float(metrics.get("design_rf2_rmsd"), 99.0),
+                "ranking_score": ranking_score,
+                "threaded_pdb": str(threaded_pdb),
+                "rf2_best_pdb": str(metrics.get("rf2_best_pdb", "")),
+                "cdr1_edit_count": len(edited_pos),
+                "cdr1_edited_positions": ",".join(str(x) for x in sorted(set(edited_pos))),
+                "warning": warning,
+            }
+            candidate_row.update(af3score_fields)
+            candidates.append(candidate_row)
             existing_ids.add(cid)
 
         branch_fields = [
@@ -3130,6 +3339,7 @@ def run_phase_next_test1_local_maturation(
             "rf2_pae",
             "design_vs_rf2_rmsd",
             "ranking_score",
+            *AF3SCORE_FIELDS,
             "threaded_pdb",
             "rf2_best_pdb",
             "cdr1_edit_count",
@@ -3178,6 +3388,7 @@ def run_phase_next_test1_local_maturation(
         df[col] = df[col].astype(int)
     for col in ("rf2_pae", "design_vs_rf2_rmsd", "ranking_score"):
         df[col] = df[col].astype(float)
+    ensure_combined_score_column(df)
     dup = df["full_sequence"].astype(str).duplicated(keep=False)
     df["unique_sequence_flag"] = (~dup).astype(int)
     df = df.sort_values(["branch_name", "rf2_pae", "design_vs_rf2_rmsd", "candidate_id"], ascending=[True, True, True, True])
@@ -3196,6 +3407,7 @@ def run_phase_next_test1_local_maturation(
         "rf2_pae",
         "design_vs_rf2_rmsd",
         "ranking_score",
+        *AF3SCORE_FIELDS,
         "strict_pass",
         "relaxed_pass",
         "full_sequence",
@@ -3219,6 +3431,10 @@ def run_phase_next_test1_local_maturation(
         "rf2_pae",
         "design_vs_rf2_rmsd",
         "ranking_score",
+        "combined_ranking_score",
+        "af3score_rank_score",
+        "af3score_status",
+        "af3score_validation_pass",
         "full_sequence",
         "unique_sequence_flag",
         "editable_positions",
@@ -3235,7 +3451,7 @@ def run_phase_next_test1_local_maturation(
     branch_lines: List[str] = [
         SAFETY_ETHICS_STATEMENT,
         "",
-        f"# Test1 Local Maturation (RF2-Only): {phase_name}",
+        f"# Test1 Local Maturation (RF2 + AF3Score-gated): {phase_name}",
         "",
     ]
     branch_lines.append(f"- Resolved Test1 parent candidate ID: `{parent['candidate_id']}`")
@@ -3253,8 +3469,14 @@ def run_phase_next_test1_local_maturation(
         strict_rate = strict_count / max(1, total)
         relaxed_rate = relaxed_count / max(1, total)
         bdf["rf2_quality"] = bdf["rf2_pae"] + bdf["design_vs_rf2_rmsd"]
-        bbest = bdf.sort_values(["rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"]).head(1)
-        btop = bdf.sort_values(["rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"]).head(max(1, top_n))
+        bbest = bdf.sort_values(
+            ["combined_ranking_score", "ranking_score", "rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"],
+            ascending=[False, False, True, True, True],
+        ).head(1)
+        btop = bdf.sort_values(
+            ["combined_ranking_score", "ranking_score", "rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"],
+            ascending=[False, False, True, True, True],
+        ).head(max(1, top_n))
         top3_quality = float(btop["rf2_quality"].mean()) if not btop.empty else 999.0
         top1_quality = float(bbest.iloc[0]["rf2_quality"]) if not bbest.empty else 999.0
         strict_unique_count = int(bdf[(bdf["strict_pass"] == 1) & (bdf["unique_sequence_flag"] == 1)].shape[0])
@@ -3275,15 +3497,17 @@ def run_phase_next_test1_local_maturation(
         if not bbest.empty:
             row = bbest.iloc[0]
             branch_lines.append(
-                f"- Best RF2 candidate: `{row['candidate_id']}` "
-                f"(pAE={float(row['rf2_pae']):.3f}, RMSD={float(row['design_vs_rf2_rmsd']):.3f})"
+                f"- Best combined candidate: `{row['candidate_id']}` "
+                f"(pAE={float(row['rf2_pae']):.3f}, RMSD={float(row['design_vs_rf2_rmsd']):.3f}, "
+                f"combined={float(row.get('combined_ranking_score', row['ranking_score'])):.3f})"
             )
-        branch_lines.append("- Top 3 RF2 candidates:")
+        branch_lines.append("- Top combined candidates:")
         for _, row in btop.iterrows():
             branch_lines.append(
                 f"  - `{row['candidate_id']}` "
                 f"(pAE={float(row['rf2_pae']):.3f}, RMSD={float(row['design_vs_rf2_rmsd']):.3f}, "
-                f"quality={float(row['rf2_quality']):.3f})"
+                f"quality={float(row['rf2_quality']):.3f}, "
+                f"combined={float(row.get('combined_ranking_score', row['ranking_score'])):.3f})"
             )
         branch_lines.append(f"- Promising for expansion: {'yes' if promising else 'no'}")
         branch_lines.append("")
@@ -3516,36 +3740,49 @@ def run_phase_next_champion_narrow50(context: dict, args: argparse.Namespace):
             strict_cfg=strict_cfg,
             relaxed_cfg=relaxed_cfg,
         )
+        af3score_fields = maybe_run_af3score_validation(
+            context=context,
+            args=args,
+            phase_name=phase_name,
+            candidate_id=cid,
+            rf2_input_pdb=threaded_pdb,
+            metrics=metrics,
+            ranking_score=ranking_score,
+            rf2_relaxed_pass=bool(relaxed_pass),
+            scope_dir=line_dir,
+            logs_dir=logs_dir,
+            seed_base=seed_base,
+        )
 
         if threading_warning:
             warning_parts.append(threading_warning)
         warning = " | ".join(warning_parts)
-        candidates.append(
-            {
-                "phase": phase_name,
-                "line_name": branch_name,
-                "phase_line_id": line_id,
-                "parent_candidate_id": parent["candidate_id"],
-                "parent_ref_source": parent.get("alias_source", ""),
-                "resolved_phase7_job_name": parent.get("resolved_phase7_job_name", ""),
-                "candidate_id": cid,
-                "editable_positions": ",".join(str(x) for x in editable_positions),
-                "fixed_core_positions": ",".join(str(x) for x in fixed_core_positions),
-                "hotspot_set_name": hotspot_set["set_name"],
-                "hotspot_tokens": ",".join(hotspot_set["tokens"]),
-                "full_sequence": final_seq,
-                "strict_pass": int(strict_pass),
-                "relaxed_pass": int(relaxed_pass),
-                "rf2_pae": _safe_float(metrics.get("rf2_pae"), 99.0),
-                "design_vs_rf2_rmsd": _safe_float(metrics.get("design_rf2_rmsd"), 99.0),
-                "ranking_score": ranking_score,
-                "threaded_pdb": str(threaded_pdb),
-                "rf2_best_pdb": str(metrics.get("rf2_best_pdb", "")),
-                "cdr1_edit_count": len(edited_pos),
-                "cdr1_edited_positions": ",".join(str(x) for x in sorted(set(edited_pos))),
-                "warning": warning,
-            }
-        )
+        candidate_row = {
+            "phase": phase_name,
+            "line_name": branch_name,
+            "phase_line_id": line_id,
+            "parent_candidate_id": parent["candidate_id"],
+            "parent_ref_source": parent.get("alias_source", ""),
+            "resolved_phase7_job_name": parent.get("resolved_phase7_job_name", ""),
+            "candidate_id": cid,
+            "editable_positions": ",".join(str(x) for x in editable_positions),
+            "fixed_core_positions": ",".join(str(x) for x in fixed_core_positions),
+            "hotspot_set_name": hotspot_set["set_name"],
+            "hotspot_tokens": ",".join(hotspot_set["tokens"]),
+            "full_sequence": final_seq,
+            "strict_pass": int(strict_pass),
+            "relaxed_pass": int(relaxed_pass),
+            "rf2_pae": _safe_float(metrics.get("rf2_pae"), 99.0),
+            "design_vs_rf2_rmsd": _safe_float(metrics.get("design_rf2_rmsd"), 99.0),
+            "ranking_score": ranking_score,
+            "threaded_pdb": str(threaded_pdb),
+            "rf2_best_pdb": str(metrics.get("rf2_best_pdb", "")),
+            "cdr1_edit_count": len(edited_pos),
+            "cdr1_edited_positions": ",".join(str(x) for x in sorted(set(edited_pos))),
+            "warning": warning,
+        }
+        candidate_row.update(af3score_fields)
+        candidates.append(candidate_row)
         existing_ids.add(cid)
 
     field_order = [
@@ -3566,6 +3803,7 @@ def run_phase_next_champion_narrow50(context: dict, args: argparse.Namespace):
         "rf2_pae",
         "design_vs_rf2_rmsd",
         "ranking_score",
+        *AF3SCORE_FIELDS,
         "threaded_pdb",
         "rf2_best_pdb",
         "cdr1_edit_count",
@@ -3595,6 +3833,7 @@ def run_phase_next_champion_narrow50(context: dict, args: argparse.Namespace):
         df[col] = df[col].astype(int)
     for col in ("rf2_pae", "design_vs_rf2_rmsd", "ranking_score"):
         df[col] = df[col].astype(float)
+    ensure_combined_score_column(df)
     dup = df["full_sequence"].astype(str).duplicated(keep=False)
     df["unique_sequence_flag"] = (~dup).astype(int)
     df = df.sort_values(["rf2_pae", "design_vs_rf2_rmsd", "candidate_id"], ascending=[True, True, True])
@@ -3612,6 +3851,7 @@ def run_phase_next_champion_narrow50(context: dict, args: argparse.Namespace):
         "rf2_pae",
         "design_vs_rf2_rmsd",
         "ranking_score",
+        *AF3SCORE_FIELDS,
         "strict_pass",
         "relaxed_pass",
         "full_sequence",
@@ -3637,6 +3877,10 @@ def run_phase_next_champion_narrow50(context: dict, args: argparse.Namespace):
         "rf2_pae",
         "design_vs_rf2_rmsd",
         "ranking_score",
+        "combined_ranking_score",
+        "af3score_rank_score",
+        "af3score_status",
+        "af3score_validation_pass",
         "full_sequence",
         "unique_sequence_flag",
         "editable_positions",
@@ -3656,8 +3900,14 @@ def run_phase_next_champion_narrow50(context: dict, args: argparse.Namespace):
     strict_rate = strict_count / max(1, total)
     relaxed_rate = relaxed_count / max(1, total)
     df["rf2_quality"] = df["rf2_pae"] + df["design_vs_rf2_rmsd"]
-    best_row = df.sort_values(["rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"]).head(1)
-    top3 = df.sort_values(["rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"]).head(3)
+    best_row = df.sort_values(
+        ["combined_ranking_score", "ranking_score", "rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"],
+        ascending=[False, False, True, True, True],
+    ).head(1)
+    top3 = df.sort_values(
+        ["combined_ranking_score", "ranking_score", "rf2_quality", "rf2_pae", "design_vs_rf2_rmsd"],
+        ascending=[False, False, True, True, True],
+    ).head(3)
     top1_quality = float(best_row.iloc[0]["rf2_quality"]) if not best_row.empty else 999.0
     promising = (strict_count >= 5) or (strict_rate >= 0.10 and top1_quality < 10.0)
 
@@ -3699,7 +3949,7 @@ def run_phase_next_champion_narrow50(context: dict, args: argparse.Namespace):
         except Exception:
             pass
 
-    lines = [SAFETY_ETHICS_STATEMENT, "", "# Champion Narrow50 Local Maturation (RF2-Only)", ""]
+    lines = [SAFETY_ETHICS_STATEMENT, "", "# Champion Narrow50 Local Maturation (RF2 + AF3Score-gated)", ""]
     lines.append(f"- Resolved parent candidate ID: `{parent['candidate_id']}`")
     lines.append(f"- Parent resolution source: `{parent.get('alias_source', '')}`")
     lines.append(f"- Stage7 best job used for parent resolution: `{parent.get('resolved_phase7_job_name', '')}`")
@@ -3713,14 +3963,16 @@ def run_phase_next_champion_narrow50(context: dict, args: argparse.Namespace):
     if not best_row.empty:
         row = best_row.iloc[0]
         lines.append(
-            f"- Best RF2 candidate: `{row['candidate_id']}` "
-            f"(pAE={float(row['rf2_pae']):.3f}, RMSD={float(row['design_vs_rf2_rmsd']):.3f}, quality={float(row['rf2_quality']):.3f})"
+            f"- Best combined candidate: `{row['candidate_id']}` "
+            f"(pAE={float(row['rf2_pae']):.3f}, RMSD={float(row['design_vs_rf2_rmsd']):.3f}, "
+            f"quality={float(row['rf2_quality']):.3f}, combined={float(row.get('combined_ranking_score', row['ranking_score'])):.3f})"
         )
-    lines.append("- Top 3 RF2 candidates:")
+    lines.append("- Top combined candidates:")
     for _, row in top3.iterrows():
         lines.append(
             f"  - `{row['candidate_id']}` "
-            f"(pAE={float(row['rf2_pae']):.3f}, RMSD={float(row['design_vs_rf2_rmsd']):.3f}, quality={float(row['rf2_quality']):.3f})"
+            f"(pAE={float(row['rf2_pae']):.3f}, RMSD={float(row['design_vs_rf2_rmsd']):.3f}, "
+            f"quality={float(row['rf2_quality']):.3f}, combined={float(row.get('combined_ranking_score', row['ranking_score'])):.3f})"
         )
     lines.append("")
     lines.append("## RF2 Benchmark Comparison")
@@ -3732,7 +3984,7 @@ def run_phase_next_champion_narrow50(context: dict, args: argparse.Namespace):
     lines.append(
         f"- Promising for later AF3/manual evaluation and larger-scale expansion: {'yes' if promising else 'no'}"
     )
-    lines.append("- This conclusion is RF2-only and does not claim AF3/interface improvement.")
+    lines.append("- AF3Score is evaluated only for RF2 relaxed-surrogate candidates when af3score.enabled=true.")
     summary_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 def run_phase_design(
@@ -3956,7 +4208,21 @@ def run_phase_design(
                     metrics["structural_plausibility"] = max(0.0, min(1.0, float(metrics.get("rf2_pred_lddt", 0.0))))
 
                 passed = hard_pass(metrics, filter_cfg)
+                relaxed_pass = relaxed_surrogate_pass(metrics, filter_cfg)
                 rank_score = combine_weighted_score(metrics, rank_weights)
+                af3score_fields = maybe_run_af3score_validation(
+                    context=context,
+                    args=args,
+                    phase_name=phase_name,
+                    candidate_id=cid,
+                    rf2_input_pdb=designed_pdb,
+                    metrics=metrics,
+                    ranking_score=rank_score,
+                    rf2_relaxed_pass=relaxed_pass,
+                    scope_dir=combo_dir,
+                    logs_dir=logs_dir,
+                    seed_base=seed_base,
+                )
 
                 row = {
                     "phase": phase_name,
@@ -3989,6 +4255,7 @@ def run_phase_design(
                     "ranking_score": round(float(rank_score), 6),
                     "warning": warning_msg,
                 }
+                row.update(af3score_fields)
                 candidates.append(row)
                 existing_candidate_ids.add(cid)
 
@@ -4021,6 +4288,7 @@ def run_phase_design(
             "hotspot_overlap_count",
             "hard_filter_pass",
             "ranking_score",
+            *AF3SCORE_FIELDS,
             "warning",
         ]
         write_rows(candidates_csv, candidates, candidate_fields)
@@ -4035,13 +4303,19 @@ def run_phase_design(
                 "h3_length": combo.h3_length,
                 "total_candidates": 0,
                 "hard_pass_candidates": 0,
+                "rf2_relaxed_pass_candidates": 0,
+                "af3score_scored_candidates": 0,
                 "unique_sequences": 0,
                 "unique_ranking_scores": 0,
                 "unique_backbone_signatures": 0,
                 "best_ranking_score": 0.0,
                 "mean_ranking_score": 0.0,
+                "best_combined_ranking_score": 0.0,
+                "mean_combined_ranking_score": 0.0,
+                "mean_af3score_rank_score": 0.0,
             }
         else:
+            ensure_combined_score_column(df)
             uniq_seq = int(df["full_sequence"].nunique()) if "full_sequence" in df.columns else 0
             uniq_rank = int(df["ranking_score"].nunique()) if "ranking_score" in df.columns else 0
             if "backbone_signature" in df.columns:
@@ -4074,11 +4348,16 @@ def run_phase_design(
                 "h3_length": combo.h3_length,
                 "total_candidates": int(df.shape[0]),
                 "hard_pass_candidates": int(df["hard_filter_pass"].sum()),
+                "rf2_relaxed_pass_candidates": int(pd.to_numeric(df.get("rf2_relaxed_pass", 0), errors="coerce").fillna(0).sum()),
+                "af3score_scored_candidates": int(df["af3score_status"].isin(["completed", "dry_run"]).sum()) if "af3score_status" in df.columns else 0,
                 "unique_sequences": uniq_seq,
                 "unique_ranking_scores": uniq_rank,
                 "unique_backbone_signatures": uniq_backbone_sig,
                 "best_ranking_score": float(df["ranking_score"].max()),
                 "mean_ranking_score": float(df["ranking_score"].mean()),
+                "best_combined_ranking_score": float(df["combined_ranking_score"].max()),
+                "mean_combined_ranking_score": float(df["combined_ranking_score"].mean()),
+                "mean_af3score_rank_score": float(pd.to_numeric(df.get("af3score_rank_score", 0), errors="coerce").dropna().mean()) if "af3score_rank_score" in df.columns and pd.to_numeric(df.get("af3score_rank_score", 0), errors="coerce").notna().any() else 0.0,
                 "mean_rf2_pae": float(df["rf2_pae"].mean()),
                 "mean_design_rf2_rmsd": float(df["design_rf2_rmsd"].mean()),
             }
@@ -4119,11 +4398,16 @@ def run_phase_design(
         "h3_length",
         "total_candidates",
         "hard_pass_candidates",
+        "rf2_relaxed_pass_candidates",
+        "af3score_scored_candidates",
         "unique_sequences",
         "unique_ranking_scores",
         "unique_backbone_signatures",
         "best_ranking_score",
         "mean_ranking_score",
+        "best_combined_ranking_score",
+        "mean_combined_ranking_score",
+        "mean_af3score_rank_score",
         "mean_rf2_pae",
         "mean_design_rf2_rmsd",
     ]
@@ -4161,8 +4445,8 @@ def select_top_combinations(summaries: List[dict], top_n: int, out_csv: Path):
         summaries,
         key=lambda x: (
             int(x.get("hard_pass_candidates", 0)),
-            float(x.get("best_ranking_score", 0.0)),
-            float(x.get("mean_ranking_score", 0.0)),
+            float(x.get("best_combined_ranking_score", x.get("best_ranking_score", 0.0))),
+            float(x.get("mean_combined_ranking_score", x.get("mean_ranking_score", 0.0))),
         ),
         reverse=True,
     )
@@ -4177,6 +4461,7 @@ def select_top_combinations(summaries: List[dict], top_n: int, out_csv: Path):
                 "h3_length": row["h3_length"],
                 "hard_pass_candidates": row.get("hard_pass_candidates", 0),
                 "best_ranking_score": row.get("best_ranking_score", 0),
+                "best_combined_ranking_score": row.get("best_combined_ranking_score", row.get("best_ranking_score", 0)),
             }
         )
 
@@ -4191,6 +4476,7 @@ def select_top_combinations(summaries: List[dict], top_n: int, out_csv: Path):
             "h3_length",
             "hard_pass_candidates",
             "best_ranking_score",
+            "best_combined_ranking_score",
         ],
     )
 
@@ -4218,16 +4504,25 @@ def select_top25_pre_h2(context: dict, phase_name: str):
     passed = [r for r in rows if int(r.get("hard_filter_pass", 0)) == 1]
     if not passed:
         # Fail gracefully but preserve top scoring if nothing passes.
-        passed = sorted(rows, key=lambda x: float(x.get("ranking_score", 0.0)), reverse=True)
+        passed = sorted(
+            rows,
+            key=combined_score,
+            reverse=True,
+        )
+    ensure_combined_scores(passed)
 
     dedup_threshold = float(pipeline_cfg.get("postprocess", {}).get("sequence_dedup_identity_threshold", 0.95))
     deduped = greedy_sequence_dedup(
         rows=passed,
         sequence_key="full_sequence",
-        score_key="ranking_score",
+        score_key="combined_ranking_score",
         identity_threshold=dedup_threshold,
     )
-    ranked = sorted(deduped, key=lambda x: float(x.get("ranking_score", 0.0)), reverse=True)
+    ranked = sorted(
+        deduped,
+        key=combined_score,
+        reverse=True,
+    )
     top25 = ranked[:25]
 
     out = root / "results/summaries/phase3_top25_pre_h2.csv"
@@ -4256,6 +4551,7 @@ def select_top25_pre_h2(context: dict, phase_name: str):
         "hotspot_overlap_count",
         "hard_filter_pass",
         "ranking_score",
+        *AF3SCORE_FIELDS,
         "warning",
     ]
     atomic_write_csv(out, top25, fields)
@@ -4388,44 +4684,60 @@ def run_phase4_h2_refine(context: dict, args: argparse.Namespace):
                 metrics["structural_plausibility"] = max(0.0, min(1.0, float(metrics.get("rf2_pred_lddt", 0.0))))
 
             passed = hard_pass(metrics, filter_cfg)
+            relaxed_pass = relaxed_surrogate_pass(metrics, filter_cfg)
             score = combine_weighted_score(metrics, rank_weights)
-
-            variant_rows.append(
-                {
-                    "parent_candidate_id": parent_id,
-                    "candidate_id": vid,
-                    "phase": "phase4_h2_refine",
-                    "combination_id": row.get("combination_id", ""),
-                    "campaign_name": campaign_name,
-                    "h1_length": h1_len,
-                    "h3_length": h3_len,
-                    "parent_backbone_id": parent_backbone,
-                    "parent_backbone_pdb": parent_backbone_pdb,
-                    "designed_pdb": str(designed_pdb),
-                    "rf2_best_pdb": str(metrics.get("rf2_best_pdb", "")),
-                    "h1_sequence": h1_seq,
-                    "h2_sequence": h2_seq,
-                    "h3_sequence": h3_seq,
-                    "full_sequence": full_seq,
-                    "rf2_pae": metrics.get("rf2_pae", ""),
-                    "design_rf2_rmsd": metrics.get("design_rf2_rmsd", ""),
-                    "hotspot_agreement": metrics.get("hotspot_agreement", ""),
-                    "groove_localization": metrics.get("groove_localization", ""),
-                    "h1_h3_role_consistency": metrics.get("h1_h3_role_consistency", ""),
-                    "structural_plausibility": metrics.get("structural_plausibility", ""),
-                    "target_contact_residue_count": metrics.get("target_contact_residue_count", ""),
-                    "hotspot_overlap_count": metrics.get("hotspot_overlap_count", ""),
-                    "hard_filter_pass": int(passed),
-                    "ranking_score": round(float(score), 6),
-                    "warning": warning_msg,
-                }
+            af3score_fields = maybe_run_af3score_validation(
+                context=context,
+                args=args,
+                phase_name="phase4_h2_refine",
+                candidate_id=vid,
+                rf2_input_pdb=designed_pdb,
+                metrics=metrics,
+                ranking_score=score,
+                rf2_relaxed_pass=relaxed_pass,
+                scope_dir=phase_dir,
+                logs_dir=logs_dir,
+                seed_base=seed_base,
             )
+
+            variant_row = {
+                "parent_candidate_id": parent_id,
+                "candidate_id": vid,
+                "phase": "phase4_h2_refine",
+                "combination_id": row.get("combination_id", ""),
+                "campaign_name": campaign_name,
+                "h1_length": h1_len,
+                "h3_length": h3_len,
+                "parent_backbone_id": parent_backbone,
+                "parent_backbone_pdb": parent_backbone_pdb,
+                "designed_pdb": str(designed_pdb),
+                "rf2_best_pdb": str(metrics.get("rf2_best_pdb", "")),
+                "h1_sequence": h1_seq,
+                "h2_sequence": h2_seq,
+                "h3_sequence": h3_seq,
+                "full_sequence": full_seq,
+                "rf2_pae": metrics.get("rf2_pae", ""),
+                "design_rf2_rmsd": metrics.get("design_rf2_rmsd", ""),
+                "hotspot_agreement": metrics.get("hotspot_agreement", ""),
+                "groove_localization": metrics.get("groove_localization", ""),
+                "h1_h3_role_consistency": metrics.get("h1_h3_role_consistency", ""),
+                "structural_plausibility": metrics.get("structural_plausibility", ""),
+                "target_contact_residue_count": metrics.get("target_contact_residue_count", ""),
+                "hotspot_overlap_count": metrics.get("hotspot_overlap_count", ""),
+                "hard_filter_pass": int(passed),
+                "ranking_score": round(float(score), 6),
+                "warning": warning_msg,
+            }
+            variant_row.update(af3score_fields)
+            variant_rows.append(variant_row)
 
         passed_rows = [x for x in variant_rows if int(x["hard_filter_pass"]) == 1]
         if passed_rows:
-            best = sorted(passed_rows, key=lambda x: float(x["ranking_score"]), reverse=True)[0]
+            ensure_combined_scores(passed_rows)
+            best = sorted(passed_rows, key=combined_score, reverse=True)[0]
         else:
-            best = sorted(variant_rows, key=lambda x: float(x["ranking_score"]), reverse=True)[0]
+            ensure_combined_scores(variant_rows)
+            best = sorted(variant_rows, key=combined_score, reverse=True)[0]
             prior = str(best.get("warning", "")).strip()
             msg = "No H2 variants passed hard RF2 filters; selected best-scoring fallback variant."
             best["warning"] = f"{prior} | {msg}" if prior else msg
@@ -4440,13 +4752,18 @@ def run_phase4_h2_refine(context: dict, args: argparse.Namespace):
         )
 
     dedup_threshold = float(pipeline_cfg.get("postprocess", {}).get("sequence_dedup_identity_threshold", 0.95))
+    ensure_combined_scores(final_rows)
     deduped = greedy_sequence_dedup(
         rows=final_rows,
         sequence_key="full_sequence",
-        score_key="ranking_score",
+        score_key="combined_ranking_score",
         identity_threshold=dedup_threshold,
     )
-    ranked = sorted(deduped, key=lambda x: float(x["ranking_score"]), reverse=True)
+    ranked = sorted(
+        deduped,
+        key=combined_score,
+        reverse=True,
+    )
     top25 = ranked[:25]
 
     final_csv = root / "results/summaries/final25_h2_optimized_candidates.csv"
@@ -4476,6 +4793,7 @@ def run_phase4_h2_refine(context: dict, args: argparse.Namespace):
         "hotspot_overlap_count",
         "hard_filter_pass",
         "ranking_score",
+        *AF3SCORE_FIELDS,
         "warning",
     ]
     atomic_write_csv(final_csv, top25, fields)
@@ -4501,7 +4819,7 @@ def run_phase4_h2_refine(context: dict, args: argparse.Namespace):
         "notes": [
             "Backbone fixed during H2 optimization.",
             "H1 and H3 fixed during H2 optimization.",
-            "No local AlphaFold 3 execution performed by design.",
+            "AF3Score validation is run only for candidates that pass the RF2 relaxed surrogate gate when af3score.enabled=true.",
         ],
     }
     write_json(root / "results/summaries/final_metadata.json", metadata)
@@ -4547,6 +4865,11 @@ def export_af3_handoff(context: dict, final_rows: List[dict]):
         "rf2_pae",
         "design_rf2_rmsd",
         "ranking_score",
+        "combined_ranking_score",
+        "af3score_status",
+        "af3score_validation_pass",
+        "af3score_rank_score",
+        "af3score_metric_csv",
         "parent_backbone_id",
         "parent_backbone_pdb",
         "rf2_best_pdb",
@@ -4568,6 +4891,11 @@ def export_af3_handoff(context: dict, final_rows: List[dict]):
                 "rf2_pae": r.get("rf2_pae", ""),
                 "design_rf2_rmsd": r.get("design_rf2_rmsd", ""),
                 "ranking_score": r.get("ranking_score", ""),
+                "combined_ranking_score": r.get("combined_ranking_score", r.get("ranking_score", "")),
+                "af3score_status": r.get("af3score_status", ""),
+                "af3score_validation_pass": r.get("af3score_validation_pass", ""),
+                "af3score_rank_score": r.get("af3score_rank_score", ""),
+                "af3score_metric_csv": r.get("af3score_metric_csv", ""),
                 "parent_backbone_id": r.get("parent_backbone_id", ""),
                 "parent_backbone_pdb": r.get("parent_backbone_pdb", ""),
                 "rf2_best_pdb": r.get("rf2_best_pdb", ""),
