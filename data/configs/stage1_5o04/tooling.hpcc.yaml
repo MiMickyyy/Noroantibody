@@ -1,0 +1,28 @@
+execute_real_tools: true
+
+rfdiffusion:
+  command_prefix:
+    - /rhome/xli616/Norovirus/data/framework/external/RFantibody/.venv/bin/rfdiffusion
+  run_cwd: /rhome/xli616/Norovirus/data/framework/external/RFantibody
+
+proteinmpnn:
+  command_prefix:
+    - /rhome/xli616/Norovirus/data/framework/external/RFantibody/.venv/bin/proteinmpnn
+  run_cwd: /rhome/xli616/Norovirus/data/framework/external/RFantibody
+
+rf2:
+  command_prefix:
+    - /rhome/xli616/Norovirus/data/framework/external/RFantibody/.venv/bin/rf2
+  run_cwd: /rhome/xli616/Norovirus/data/framework/external/RFantibody
+
+af3score:
+  command_prefix:
+    - bash
+    - /rhome/xli616/Norovirus/scripts/hpcc/run_af3score_hpcc.sh
+  run_cwd: /rhome/xli616/Norovirus
+  num_jobs: 1
+
+checkpoints:
+  rfdiffusion_weights: /rhome/xli616/Norovirus/data/framework/external/RFantibody/weights/RFdiffusion_Ab.pt
+  proteinmpnn_weights: /rhome/xli616/Norovirus/data/framework/external/RFantibody/weights/ProteinMPNN_v48_noise_0.2.pt
+  rf2_weights: /rhome/xli616/Norovirus/data/framework/external/RFantibody/weights/RF2_ab.pt

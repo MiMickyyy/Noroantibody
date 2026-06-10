@@ -1,0 +1,5 @@
+resolved_inputs:
+  vp1_sequence_file: /rhome/xli616/Norovirus/data/raw/sanitized/VP1.prot
+  p_domain_dimer_sequence_file: /rhome/xli616/Norovirus/data/raw/sanitized/P-domain_dimer.prot
+  nanobody_sequence_file: /rhome/xli616/Norovirus/data/raw/sanitized/Nanobody.fa
+  nanobody_framework_pdb_file: /rhome/xli616/Norovirus/data/raw/sanitized/Nanobody_HLT.pdb

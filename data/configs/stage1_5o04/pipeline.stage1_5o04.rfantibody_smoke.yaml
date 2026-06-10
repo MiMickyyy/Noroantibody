@@ -1,0 +1,63 @@
+project:
+  name: "stage1_5O04_hotspot_transfer_rfantibody_smoke"
+  random_seed: 20260609
+  gpu:
+    type: "H100_or_A100"
+    count: 1
+
+inputs:
+  vp1_sequence_file: "VP1.prot"
+  p_domain_dimer_sequence_file: "P-domain dimer.prot"
+  nanobody_sequence_file: "Nanobody.fa"
+  nanobody_framework_pdb_file: "data/raw/sanitized/Nanobody_HLT.pdb"
+  local_antigen_structure_file: "data/target/antigen_full_cleaned_AB.pdb"
+
+target_prep:
+  antigen_chain_ids: [A, B]
+  numbering_mode: "full_vp1"
+
+stage1_5o04:
+  core_hotspots_crop: [49, 53, 238, 241, 243]
+  core_hotspots_full_vp1: [273, 277, 462, 465, 467]
+  monitoring_epitope_crop: [48, 49, 53, 238, 239, 240, 241, 243]
+  monitoring_epitope_full_vp1: [272, 273, 277, 462, 463, 464, 465, 467]
+  expected_conditions: 50
+  expected_designs: 1500
+
+execution:
+  dry_run_default: false
+  resume_default: true
+  max_gpu_parallel_jobs: 1
+  fail_fast: false
+  memory_safe:
+    cleanup_mode: "after_each_condition"
+    retain_failed_relaxed: "metadata_only"
+    retain_rf2_relaxed_pass: "required_inputs_and_metrics"
+    retain_top_structures: true
+    retain_all_raw_intermediates: false
+    max_memory_gb: 50
+
+filters:
+  hard_thresholds:
+    rf2_pae_max: 10.0
+    design_rf2_rmsd_max: 2.0
+  relaxed_thresholds:
+    rf2_pae_max: 12.0
+    design_rf2_rmsd_max: 2.5
+  ranking_weights:
+    rf2_self_consistency: 0.40
+    hotspot_agreement: 0.25
+    docking_localization: 0.20
+    structural_plausibility: 0.10
+    h1_h3_role_consistency: 0.05
+
+af3score:
+  enabled: false
+  score_relaxed_only: true
+  ranking_weights:
+    rf2: 0.60
+    af3score: 0.40
+
+postprocess:
+  sequence_dedup_identity_threshold: 0.95
+  structural_clustering_enabled: false

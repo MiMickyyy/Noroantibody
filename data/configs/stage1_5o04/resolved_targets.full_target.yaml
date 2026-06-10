@@ -1,0 +1,6 @@
+full_cleaned_target: data/target/antigen_full_cleaned_AB.pdb
+cropped_design_target: data/target/antigen_full_cleaned_AB.pdb
+mapping_table: data/maps/residue_mapping_table.csv
+crop_report: data/target/target_prep_report.json
+numbering_mode: full_vp1
+note: "For this Stage1, cropped_design_target intentionally points to the full cleaned P-domain dimer because 5O04 hotspot residues are outside the older cropped top-cap target."

@@ -1,0 +1,43 @@
+#!/bin/bash -l
+#SBATCH --job-name=noro_5o04_a100_smoke
+#SBATCH --partition=short_gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --time=02:00:00
+#SBATCH --array=0-0%1
+#SBATCH --output=/rhome/xli616/Norovirus/outputs/stage1_5O04_hotspot_transfer/logs/a100_smoke_%A_%a.out
+#SBATCH --error=/rhome/xli616/Norovirus/outputs/stage1_5O04_hotspot_transfer/logs/a100_smoke_%A_%a.err
+
+set -euo pipefail
+
+PROJECT_ROOT=/rhome/xli616/Norovirus
+OUT_ROOT=${PROJECT_ROOT}/outputs/stage1_5O04_hotspot_transfer
+mkdir -p "${OUT_ROOT}/logs"
+
+cd "${PROJECT_ROOT}"
+
+module load gcc/12.2.0 || true
+module load cuda/11.8 || true
+export DGLBACKEND=pytorch
+export PATH=/rhome/xli616/Norovirus/data/framework/external/RFantibody/.venv/bin:${PATH}
+export LD_LIBRARY_PATH=/rhome/xli616/.conda/envs/noro_rfantibody/lib:${LD_LIBRARY_PATH:-}
+
+echo "JOB_START $(date --iso-8601=seconds)"
+echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
+echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
+echo "HOST=$(hostname)"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+nvidia-smi || true
+
+/rhome/xli616/.conda/envs/noro_rfantibody/bin/python scripts/run_stage1_5o04_campaign.py \
+  --execute \
+  --condition-index "${SLURM_ARRAY_TASK_ID}" \
+  --limit-backbones 2 \
+  --output-root outputs/stage1_5O04_hotspot_transfer \
+  --pipeline-config data/configs/stage1_5o04/pipeline.stage1_5o04.rfantibody_smoke.yaml \
+  --tooling-config data/configs/stage1_5o04/tooling.hpcc.yaml \
+  --resolved-inputs data/configs/stage1_5o04/resolved_inputs.hpcc.yaml \
+  --resolved-targets data/configs/stage1_5o04/resolved_targets.full_target.yaml
+
+echo "JOB_END $(date --iso-8601=seconds)"
