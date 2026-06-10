@@ -3,7 +3,7 @@
 #SBATCH --partition=batch
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --time=04:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --output=/rhome/xli616/Norovirus/outputs/stage1_5O04_hotspot_transfer_af3_smoke/logs/af3score_parent_%j.out
 #SBATCH --error=/rhome/xli616/Norovirus/outputs/stage1_5O04_hotspot_transfer_af3_smoke/logs/af3score_parent_%j.err
 
@@ -23,11 +23,11 @@ test -r "${SOURCE_PDB}"
 cp "${SOURCE_PDB}" "${OUT_ROOT}/input_pdb/af3_smoke.pdb"
 
 export AF3SCORE_PARTITION=${AF3SCORE_PARTITION:-short_gpu}
-export AF3SCORE_GRES=${AF3SCORE_GRES:-gpu:a100:1}
+export AF3SCORE_GRES=${AF3SCORE_GRES:-gpu:blackwell6000:1}
 export AF3SCORE_CPUS=${AF3SCORE_CPUS:-8}
 export AF3SCORE_MEM=${AF3SCORE_MEM:-48G}
 export AF3SCORE_CUDA_MODULE=${AF3SCORE_CUDA_MODULE:-cuda/12.4}
-export AF3SCORE_FLASH_ATTENTION=${AF3SCORE_FLASH_ATTENTION:-triton}
+export AF3SCORE_FLASH_ATTENTION=${AF3SCORE_FLASH_ATTENTION:-xla}
 export AF3SCORE_DB_DIR=${AF3SCORE_DB_DIR:-/bigdata/operations/pkgadmin/srv/projects/db/alphafold/3.0.0}
 export AF3SCORE_MODEL_DIR=${AF3SCORE_MODEL_DIR:-${AF3SCORE_DB_DIR}/model}
 
