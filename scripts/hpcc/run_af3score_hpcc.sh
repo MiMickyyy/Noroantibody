@@ -207,6 +207,7 @@ start_time=\$(date +%s)
 module load ${AF3SCORE_CUDA_MODULE} || true
 cuda_data_dir="\${CUDA_HOME:-\${CUDA_PATH:-/opt/linux/rocky/8.x/x86_64/pkgs/cuda/12.8}}"
 export XLA_FLAGS="\${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=true --xla_gpu_cuda_data_dir=\${cuda_data_dir}"
+export AF3SCORE_CUDA_DATA_DIR="\${cuda_data_dir}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 unset XLA_PYTHON_CLIENT_MEM_FRACTION
 export XLA_CLIENT_MEM_FRACTION=${AF3SCORE_JAX_MEM_FRACTION}
@@ -227,7 +228,7 @@ fi
 
 echo "Running AF3Score on: \$batch_json_dir  \$batch_h5_dir  buckets=\$buckets -> \$output_dir"
 
-"\$4" "\$5/run_af3score.py" \\
+"\$4" "\$5/run_af3score_hpcc_launcher.py" "\$5/run_af3score.py" \\
   --db_dir="${AF3SCORE_DB_DIR}" \\
   --model_dir="${AF3SCORE_MODEL_DIR}" \\
   --batch_json_dir="\$batch_json_dir" \\
@@ -254,6 +255,43 @@ echo "========== Total runtime: \${elapsed} seconds =========="
 EOF
 
 chmod +x "$runtime_dir/"*.sh
+
+cat > "$runtime_dir/run_af3score_hpcc_launcher.py" <<'PY'
+#!/usr/bin/env python3
+"""Run AF3Score after forcing JAX to use the system CUDA toolkit."""
+
+from __future__ import annotations
+
+import os
+import runpy
+import sys
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        raise SystemExit("usage: run_af3score_hpcc_launcher.py <run_af3score.py> [args...]")
+
+    script = sys.argv[1]
+    cuda_data_dir = os.environ.get(
+        "AF3SCORE_CUDA_DATA_DIR",
+        os.environ.get("CUDA_HOME", os.environ.get("CUDA_PATH", "")),
+    )
+    if cuda_data_dir:
+        try:
+            from jax._src import lib as jax_lib
+
+            jax_lib.cuda_path = cuda_data_dir
+            print(f"[AF3Score HPCC adapter] JAX cuda_path={cuda_data_dir}", flush=True)
+        except Exception as exc:
+            print(f"[AF3Score HPCC adapter] warning: could not patch JAX cuda_path: {exc}", flush=True)
+
+    sys.argv = [script, *sys.argv[2:]]
+    runpy.run_path(script, run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()
+PY
 
 cat > "$output_dir/af3score_hpcc_runtime_config.txt" <<EOF
 AF3SCORE_DIR=$AF3SCORE_DIR
