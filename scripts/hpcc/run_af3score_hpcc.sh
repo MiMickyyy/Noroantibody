@@ -205,7 +205,7 @@ start_time=\$(date +%s)
 module load ${AF3SCORE_CUDA_MODULE} || true
 export XLA_FLAGS="\${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=true"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export XLA_PYTHON_CLIENT_MEM_FRACTION=${AF3SCORE_JAX_MEM_FRACTION}
+unset XLA_PYTHON_CLIENT_MEM_FRACTION
 export XLA_CLIENT_MEM_FRACTION=${AF3SCORE_JAX_MEM_FRACTION}
 if [[ -n "\${AF3SCORE_HMMER_PATH:-}" ]]; then
   export PATH="\${AF3SCORE_HMMER_PATH}:\$PATH"
