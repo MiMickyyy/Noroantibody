@@ -23,6 +23,8 @@ Required runtime resources:
 Optional Slurm controls:
   AF3SCORE_PARTITION  Default: gpu
   AF3SCORE_NODELIST   Default: empty
+  AF3SCORE_QOS        Default: empty
+  AF3SCORE_TIME       Default: empty
   AF3SCORE_GRES       Default: gpu:1
   AF3SCORE_CPUS       Default: 8
   AF3SCORE_MEM        Default: 48G
@@ -42,6 +44,8 @@ AF3SCORE_DIR="${AF3SCORE_DIR:-/rhome/xli616/Norovirus/external/AF3Score}"
 AF3SCORE_PYTHON="${AF3SCORE_PYTHON:-/rhome/xli616/.conda/envs/noro_af3score/bin/python}"
 AF3SCORE_PARTITION="${AF3SCORE_PARTITION:-gpu}"
 AF3SCORE_NODELIST="${AF3SCORE_NODELIST:-}"
+AF3SCORE_QOS="${AF3SCORE_QOS:-}"
+AF3SCORE_TIME="${AF3SCORE_TIME:-}"
 AF3SCORE_GRES="${AF3SCORE_GRES:-gpu:1}"
 AF3SCORE_CPUS="${AF3SCORE_CPUS:-8}"
 AF3SCORE_MEM="${AF3SCORE_MEM:-48G}"
@@ -52,6 +56,7 @@ AF3SCORE_MODEL_DIR="${AF3SCORE_MODEL_DIR:-${AF3SCORE_DB_DIR}/model}"
 AF3SCORE_FLASH_ATTENTION="${AF3SCORE_FLASH_ATTENTION:-triton}"
 AF3SCORE_PREPARE_WORKERS="${AF3SCORE_PREPARE_WORKERS:-6}"
 AF3SCORE_JAX_MEM_FRACTION="${AF3SCORE_JAX_MEM_FRACTION:-0.80}"
+export AF3SCORE_QOS AF3SCORE_TIME
 
 fail() {
   echo "[AF3Score HPCC adapter] ERROR: $*" >&2
@@ -112,16 +117,24 @@ submit_job() {
   local log_file="$4"
   shift 4
   local job_output
+  local sbatch_args=(--partition="$partition" --output="$log_file")
+  if [[ -n "${AF3SCORE_QOS:-}" ]]; then
+    sbatch_args+=(--qos="${AF3SCORE_QOS}")
+  fi
+  if [[ -n "${AF3SCORE_TIME:-}" ]]; then
+    sbatch_args+=(--time="${AF3SCORE_TIME}")
+  fi
   if [[ -n "$nodelist" ]]; then
-    job_output=$(sbatch --partition="$partition" --nodelist="$nodelist" --output="$log_file" "$script" "$@")
+    sbatch_args+=(--nodelist="$nodelist")
+    job_output=$(sbatch "${sbatch_args[@]}" "$script" "$@")
   else
-    job_output=$(sbatch --partition="$partition" --output="$log_file" "$script" "$@")
+    job_output=$(sbatch "${sbatch_args[@]}" "$script" "$@")
   fi
   if [[ "$job_output" =~ Submitted\ batch\ job\ ([0-9]+) ]]; then
       echo "${BASH_REMATCH[1]}"
   else
       echo "Submission failed: $job_output" >&2
-      echo "Command: sbatch --partition=$partition --nodelist=$nodelist --output=$log_file $script $*" >&2
+      echo "Command: sbatch ${sbatch_args[*]} $script $*" >&2
       exit 1
   fi
 }
@@ -298,6 +311,8 @@ AF3SCORE_DIR=$AF3SCORE_DIR
 AF3SCORE_PYTHON=$AF3SCORE_PYTHON
 AF3SCORE_PARTITION=$AF3SCORE_PARTITION
 AF3SCORE_NODELIST=$AF3SCORE_NODELIST
+AF3SCORE_QOS=$AF3SCORE_QOS
+AF3SCORE_TIME=$AF3SCORE_TIME
 AF3SCORE_GRES=$AF3SCORE_GRES
 AF3SCORE_CPUS=$AF3SCORE_CPUS
 AF3SCORE_MEM=$AF3SCORE_MEM

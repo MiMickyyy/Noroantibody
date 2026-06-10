@@ -63,6 +63,14 @@ filters:
 af3score:
   enabled: true
   score_relaxed_only: true
+  async_submit: true
+  async_submit_script: "scripts/slurm/stage1_5o04_af3score_async.sbatch"
+  async_partition: "short_gpu"
+  async_qos: "short_gpu"
+  async_time: "02:00:00"
+  async_gres: "gpu:a100:1"
+  async_cuda_module: "cuda/12.8"
+  async_flash_attention: "xla"
   ranking_weights:
     rf2: 0.60
     af3score: 0.40

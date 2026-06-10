@@ -792,6 +792,7 @@ AF3SCORE_FIELDS = [
     "af3score_metric_csv",
     "af3score_input_pdb",
     "af3score_output_dir",
+    "af3score_job_id",
 ]
 
 
@@ -823,6 +824,7 @@ def blank_af3score_fields(
         "af3score_metric_csv": "",
         "af3score_input_pdb": "",
         "af3score_output_dir": "",
+        "af3score_job_id": "",
     }
 
 

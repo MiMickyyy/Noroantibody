@@ -44,6 +44,7 @@ from pipeline_common import (  # noqa: E402
 )
 from run_pipeline import (  # noqa: E402
     AF3SCORE_FIELDS,
+    blank_af3score_fields,
     build_target_contig,
     compute_backbone_signature,
     ensure_combined_score_column,
@@ -192,6 +193,137 @@ def write_run_configs(root: Path, out_root: Path, conditions: Sequence[Stage1Con
         p = resolve_path(root, src)
         if p.exists():
             shutil.copyfile(p, cfg_dir / p.name)
+
+
+def existing_condition_rows(summary_csv: Path, expected_rows: int) -> Tuple[List[dict], set]:
+    if not summary_csv.exists():
+        return [], set()
+    try:
+        df = pd.read_csv(summary_csv)
+    except Exception:
+        return [], set()
+    if df.empty:
+        return [], set()
+    rows = df.to_dict(orient="records")
+    completed = {str(row.get("candidate_id", "")) for row in rows if str(row.get("candidate_id", "")).strip()}
+    if len(rows) < expected_rows:
+        log(f"[resume] partial condition rows found: {summary_csv} rows={len(rows)}")
+    return rows, completed
+
+
+def _append_af3_async_manifest(out_root: Path, record: dict) -> None:
+    manifest = out_root / "af3score_async_jobs.csv"
+    fields = [
+        "submitted_at",
+        "condition_name",
+        "candidate_id",
+        "af3score_job_id",
+        "af3score_input_pdb",
+        "af3score_output_dir",
+        "af3score_metric_csv",
+        "af3score_parent_stdout",
+        "af3score_parent_stderr",
+    ]
+    write_header = not manifest.exists()
+    with manifest.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({key: record.get(key, "") for key in fields})
+
+
+def submit_af3score_async(
+    *,
+    root: Path,
+    out_root: Path,
+    condition: Stage1Condition,
+    pipeline_cfg: dict,
+    candidate_id: str,
+    af3_input_pdb: Path,
+    ranking_score: float,
+    scope_dir: Path,
+    logs_dir: Path,
+    dry_run: bool,
+) -> dict:
+    af3_cfg = pipeline_cfg.get("af3score", {}) or {}
+    if dry_run:
+        return blank_af3score_fields(1, ranking_score, "submitted_async_dry_run")
+
+    script = root / str(af3_cfg.get("async_submit_script", "scripts/slurm/stage1_5o04_af3score_async.sbatch"))
+    if not script.exists():
+        raise PipelineError(f"AF3Score async submit script missing: {script}")
+    if not af3_input_pdb.exists():
+        raise PipelineError(f"AF3Score async input PDB missing: {af3_input_pdb}")
+
+    safe_stem = slugify(candidate_id)
+    out_dir = scope_dir / "af3score" / safe_stem
+    input_dir = out_dir / "input_pdb"
+    async_logs = logs_dir / "af3score_async"
+    ensure_dirs([input_dir, async_logs])
+    input_copy = input_dir / f"{safe_stem}.pdb"
+    shutil.copyfile(af3_input_pdb, input_copy)
+
+    parent_stdout = async_logs / f"{safe_stem}_parent_%j.out"
+    parent_stderr = async_logs / f"{safe_stem}_parent_%j.err"
+    export_values = {
+        "AF3_ASYNC_INPUT_DIR": str(input_dir),
+        "AF3_ASYNC_OUTPUT_DIR": str(out_dir),
+        "AF3_ASYNC_NUM_JOBS": "1",
+        "AF3_ASYNC_CANDIDATE_ID": candidate_id,
+        "AF3SCORE_PARTITION": str(af3_cfg.get("async_partition", "short_gpu")),
+        "AF3SCORE_QOS": str(af3_cfg.get("async_qos", "short_gpu")),
+        "AF3SCORE_TIME": str(af3_cfg.get("async_time", "02:00:00")),
+        "AF3SCORE_GRES": str(af3_cfg.get("async_gres", "gpu:a100:1")),
+        "AF3SCORE_CUDA_MODULE": str(af3_cfg.get("async_cuda_module", "cuda/12.8")),
+        "AF3SCORE_FLASH_ATTENTION": str(af3_cfg.get("async_flash_attention", "xla")),
+    }
+    export_arg = "ALL," + ",".join(f"{key}={value}" for key, value in export_values.items())
+    cmd = [
+        "sbatch",
+        "--parsable",
+        "--partition=batch",
+        "--cpus-per-task=4",
+        "--mem=16G",
+        "--time=2-00:00:00",
+        "--output",
+        str(parent_stdout),
+        "--error",
+        str(parent_stderr),
+        "--export",
+        export_arg,
+        str(script),
+    ]
+    try:
+        job_id = subprocess.check_output(cmd, cwd=root, text=True).strip().splitlines()[-1]
+    except subprocess.CalledProcessError as exc:
+        raise PipelineError(f"AF3Score async sbatch failed for {candidate_id}: {exc}") from exc
+
+    fields = blank_af3score_fields(1, ranking_score, "submitted_async")
+    fields.update(
+        {
+            "af3score_metric_csv": str(out_dir / "af3score_metrics.csv"),
+            "af3score_input_pdb": str(input_copy),
+            "af3score_output_dir": str(out_dir),
+            "af3score_job_id": job_id,
+        }
+    )
+    _append_af3_async_manifest(
+        out_root,
+        {
+            "submitted_at": now_iso(),
+            "condition_name": condition.condition_name,
+            "candidate_id": candidate_id,
+            "af3score_job_id": job_id,
+            "af3score_input_pdb": str(input_copy),
+            "af3score_output_dir": str(out_dir),
+            "af3score_metric_csv": str(out_dir / "af3score_metrics.csv"),
+            "af3score_parent_stdout": str(parent_stdout),
+            "af3score_parent_stderr": str(parent_stderr),
+        },
+    )
+    with (logs_dir / "condition.log").open("a", encoding="utf-8") as handle:
+        handle.write(f"{now_iso()} af3score_async_submitted candidate_id={candidate_id} job_id={job_id}\n")
+    return fields
 
 
 def residue_contact(res_a, res_b, cutoff: float) -> bool:
@@ -372,6 +504,7 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
     if not args.no_resume and is_condition_complete(summary_csv, expected):
         log(f"[resume] 完整 condition 已存在，跳过：{condition.condition_name}")
         return pd.read_csv(summary_csv).to_dict(orient="records")
+    rows, completed_ids = existing_condition_rows(summary_csv, expected) if not args.no_resume else ([], set())
 
     pipeline_cfg = read_yaml(resolve_path(root, args.pipeline_config))
     tooling = load_tool_config(resolve_path(root, args.tooling_config))
@@ -401,8 +534,6 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
     backbone_count = int(args.limit_backbones or args.backbones_per_condition)
     seqs_per_backbone = int(args.seqs_per_backbone)
     hotspot_tokens = [f"{chain}{resnum}" for chain in ("A", "B") for resnum in CORE_CROP_TO_FULL.values()]
-    rows: List[dict] = []
-
     backbones_dir = condition_dir / "backbones"
     mpnn_dir = condition_dir / "mpnn_aux"
     rf2_dir = condition_dir / "rf2_metrics"
@@ -410,6 +541,9 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
 
     for i in range(1, backbone_count + 1):
         bb_id = f"{condition.condition_name}_bb{i:03d}"
+        expected_cids = {f"{bb_id}_s{sidx:02d}" for sidx in range(1, seqs_per_backbone + 1)}
+        if expected_cids and expected_cids.issubset(completed_ids):
+            continue
         bb_pdb = backbones_dir / f"{bb_id}.pdb"
         run_rfdiffusion_backbone(
             cfg=tooling,
@@ -454,6 +588,8 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
 
         for sidx in range(1, seqs_per_backbone + 1):
             cid = f"{bb_id}_s{sidx:02d}"
+            if cid in completed_ids:
+                continue
             record = mpnn_records[min(sidx - 1, len(mpnn_records) - 1)]
             designed_pdb = Path(record.get("designed_pdb", str(bb_pdb)))
             full_seq = str(record.get("full_sequence", "")).strip().upper()
@@ -492,19 +628,39 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
                 },
                 rank_weights,
             )
-            af3_fields = maybe_run_af3score_validation(
-                context={"pipeline_cfg": pipeline_cfg, "tool_cfg": tooling},
-                args=argparse.Namespace(dry_run=dry_run),
-                phase_name="stage1_5O04_hotspot_transfer",
-                candidate_id=cid,
-                rf2_input_pdb=designed_pdb,
-                metrics=metrics,
-                ranking_score=rf2_rank,
-                rf2_relaxed_pass=relaxed_pass,
-                scope_dir=condition_dir,
-                logs_dir=logs_dir,
-                seed_base=seed_base,
-            )
+            af3_cfg = pipeline_cfg.get("af3score", {}) or {}
+            if bool(af3_cfg.get("async_submit", False)) and bool(af3_cfg.get("enabled", False)):
+                if bool(af3_cfg.get("score_relaxed_only", True)) and not relaxed_pass:
+                    af3_fields = blank_af3score_fields(int(relaxed_pass), rf2_rank, "skipped_rf2_relaxed_gate")
+                elif relaxed_pass:
+                    af3_fields = submit_af3score_async(
+                        root=root,
+                        out_root=out_root,
+                        condition=condition,
+                        pipeline_cfg=pipeline_cfg,
+                        candidate_id=cid,
+                        af3_input_pdb=Path(str(metrics.get("rf2_best_pdb") or designed_pdb)),
+                        ranking_score=rf2_rank,
+                        scope_dir=condition_dir,
+                        logs_dir=logs_dir,
+                        dry_run=dry_run,
+                    )
+                else:
+                    af3_fields = blank_af3score_fields(int(relaxed_pass), rf2_rank, "submitted_async_not_relaxed")
+            else:
+                af3_fields = maybe_run_af3score_validation(
+                    context={"pipeline_cfg": pipeline_cfg, "tool_cfg": tooling},
+                    args=argparse.Namespace(dry_run=dry_run),
+                    phase_name="stage1_5O04_hotspot_transfer",
+                    candidate_id=cid,
+                    rf2_input_pdb=designed_pdb,
+                    metrics=metrics,
+                    ranking_score=rf2_rank,
+                    rf2_relaxed_pass=relaxed_pass,
+                    scope_dir=condition_dir,
+                    logs_dir=logs_dir,
+                    seed_base=seed_base,
+                )
             row = {
                 "condition_name": condition.condition_name,
                 "design_group": condition.design_group,
@@ -532,6 +688,7 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
             row.update(af3_fields)
             row.update(contacts)
             rows.append(row)
+            completed_ids.add(cid)
             atomic_write_csv(summary_csv, rows, master_fields())
 
     cleanup = cleanup_condition(condition_dir, rows)
@@ -539,7 +696,7 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
         handle.write(
             f"{now_iso()} completed candidates={len(rows)} strict={sum(int(r['rf2_strict_pass']) for r in rows)} "
             f"relaxed={sum(int(r['rf2_relaxed_pass']) for r in rows)} "
-            f"af3_attempted={sum(str(r.get('af3score_status')) in {'completed','dry_run'} for r in rows)} "
+            f"af3_attempted={sum(str(r.get('af3score_status')) in {'completed','dry_run','submitted_async'} for r in rows)} "
             f"af3_skipped={sum(str(r.get('af3score_status')) == 'skipped_rf2_relaxed_gate' for r in rows)} "
             f"cleanup={json.dumps(cleanup, sort_keys=True)}\n"
         )
@@ -597,6 +754,7 @@ def master_fields() -> List[str]:
         "af3score_metric_csv",
         "af3score_input_pdb",
         "af3score_output_dir",
+        "af3score_job_id",
         "retained_file_policy",
         "h1_sequence",
         "h2_sequence",
@@ -677,7 +835,7 @@ def merge_outputs(root: Path, args: argparse.Namespace, conditions: Sequence[Sta
             total_generated=("candidate_id", "count"),
             rf2_strict_count=("rf2_strict_pass", "sum"),
             rf2_relaxed_count=("rf2_relaxed_pass", "sum"),
-            af3score_attempted_count=("af3score_status", lambda s: int(s.isin(["completed", "dry_run"]).sum())),
+            af3score_attempted_count=("af3score_status", lambda s: int(s.isin(["completed", "dry_run", "submitted_async"]).sum())),
             af3score_skipped_count=("af3score_status", lambda s: int((s == "skipped_rf2_relaxed_gate").sum())),
             mean_rf2_pae=("rf2_pae", "mean"),
             mean_rf2_rmsd=("design_rf2_rmsd", "mean"),
