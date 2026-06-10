@@ -5,8 +5,11 @@ set -euo pipefail
 
 AF3SCORE_DIR="${AF3SCORE_DIR:-/rhome/xli616/Norovirus/external/AF3Score}"
 AF3SCORE_ENV_PREFIX="${AF3SCORE_ENV_PREFIX:-/rhome/xli616/.conda/envs/noro_af3score}"
+CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-/rhome/xli616/.conda/pkgs}"
 MAMBA_EXE="${MAMBA_EXE:-$(command -v mamba || true)}"
 CONDA_EXE="${CONDA_EXE:-$(command -v conda || true)}"
+export CONDA_PKGS_DIRS
+mkdir -p "$CONDA_PKGS_DIRS"
 
 fail() {
   echo "[AF3Score bootstrap] ERROR: $*" >&2
