@@ -3,6 +3,8 @@
 
 set -euo pipefail
 
+module load gcc/12.2.0 || true
+
 AF3SCORE_DIR="${AF3SCORE_DIR:-/rhome/xli616/Norovirus/external/AF3Score}"
 AF3SCORE_ENV_PREFIX="${AF3SCORE_ENV_PREFIX:-/rhome/xli616/.conda/envs/noro_af3score}"
 CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-/rhome/xli616/.conda/pkgs}"
