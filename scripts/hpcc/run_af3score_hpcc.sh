@@ -205,7 +205,8 @@ echo "========== Job started at: \$(date) =========="
 start_time=\$(date +%s)
 
 module load ${AF3SCORE_CUDA_MODULE} || true
-export XLA_FLAGS="\${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=true"
+cuda_data_dir="\${CUDA_HOME:-\${CUDA_PATH:-/opt/linux/rocky/8.x/x86_64/pkgs/cuda/12.8}}"
+export XLA_FLAGS="\${XLA_FLAGS:-} --xla_gpu_enable_triton_gemm=true --xla_gpu_cuda_data_dir=\${cuda_data_dir}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 unset XLA_PYTHON_CLIENT_MEM_FRACTION
 export XLA_CLIENT_MEM_FRACTION=${AF3SCORE_JAX_MEM_FRACTION}
