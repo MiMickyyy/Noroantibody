@@ -87,6 +87,7 @@ for name in \
   03_submit_af3score.sh \
   04_get_metrics.py \
   ipsae_calculator.py \
+  model_manager_correct.py \
   run_af3score.py \
   src
 do

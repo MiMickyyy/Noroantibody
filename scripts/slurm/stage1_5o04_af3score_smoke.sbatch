@@ -20,6 +20,8 @@ module load gcc/12.2.0 || true
 module load cuda/12.4 || true
 
 test -r "${SOURCE_PDB}"
+rm -rf "${OUT_ROOT}/af3score_run"
+mkdir -p "${OUT_ROOT}/input_pdb"
 cp "${SOURCE_PDB}" "${OUT_ROOT}/input_pdb/af3_smoke.pdb"
 
 export AF3SCORE_PARTITION=${AF3SCORE_PARTITION:-short_gpu}
@@ -42,6 +44,11 @@ echo "AF3SCORE_MODEL_DIR=${AF3SCORE_MODEL_DIR}"
 bash scripts/hpcc/run_af3score_hpcc.sh "${OUT_ROOT}/input_pdb" "${OUT_ROOT}/af3score_run" 1
 
 test -s "${OUT_ROOT}/af3score_run/af3score_metrics.csv"
+metric_rows=$(tail -n +2 "${OUT_ROOT}/af3score_run/af3score_metrics.csv" | wc -l)
+if [[ "${metric_rows}" -lt 1 ]]; then
+  echo "AF3Score smoke failed: metrics CSV contains no candidate rows." >&2
+  exit 1
+fi
 echo "AF3Score metrics:"
 cat "${OUT_ROOT}/af3score_run/af3score_metrics.csv"
 echo "AF3_SMOKE_PARENT_END $(date --iso-8601=seconds)"
