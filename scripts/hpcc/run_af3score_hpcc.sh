@@ -306,6 +306,137 @@ if __name__ == "__main__":
     main()
 PY
 
+cat > "$runtime_dir/05_fallback_metrics.py" <<'PY'
+#!/usr/bin/env python3
+"""Create AF3Score metrics from AF3 confidence JSONs when upstream parsing is empty.
+
+Mingchenchen/AF3Score's 04_get_metrics.py expects model files that may not be
+written by our AF3 invocation. The confidence JSONs still contain the core
+ranking terms needed by the Norovirus pipeline, so this fallback fills the same
+CSV shape only when the upstream CSV has no data rows.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import statistics
+import sys
+from pathlib import Path
+from typing import Iterable
+
+
+FIELDNAMES = [
+    "description",
+    "ptm",
+    "iptm",
+    "ranking_score",
+    "chain_H_plddt",
+    "chain_T_plddt",
+    "interface_pae",
+    "ipsae_H_T",
+]
+
+
+def has_data_rows(csv_path: Path) -> bool:
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return False
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as handle:
+            return any(csv.DictReader(handle))
+    except Exception:
+        return False
+
+
+def mean(values: Iterable[float]) -> float | None:
+    vals = [float(v) for v in values if v is not None]
+    return statistics.fmean(vals) if vals else None
+
+
+def chain_plddt(confidences: dict, chain_id: str) -> float | None:
+    chains = confidences.get("atom_chain_ids") or []
+    plddts = confidences.get("atom_plddts") or []
+    vals = [p for c, p in zip(chains, plddts) if str(c) == chain_id]
+    return mean(vals)
+
+
+def interface_pae(summary: dict) -> float | None:
+    matrix = summary.get("chain_pair_pae_min")
+    if not isinstance(matrix, list) or len(matrix) < 2:
+        return None
+    vals = []
+    for i, row in enumerate(matrix):
+        if not isinstance(row, list):
+            continue
+        for j, value in enumerate(row):
+            if i != j and value is not None:
+                vals.append(float(value))
+    return min(vals) if vals else None
+
+
+def ipsae_from_pae(pae: float | None) -> float | None:
+    if pae is None:
+        return None
+    return max(0.0, min(1.0, 1.0 - float(pae) / 30.0))
+
+
+def round_or_blank(value: float | None, digits: int = 6):
+    if value is None:
+        return ""
+    return round(float(value), digits)
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: 05_fallback_metrics.py <metrics_csv> <af3score_outputs_dir>")
+    metrics_csv = Path(sys.argv[1])
+    outputs_dir = Path(sys.argv[2])
+    if has_data_rows(metrics_csv):
+        print(f"[AF3Score HPCC adapter] Metrics CSV already has rows: {metrics_csv}", flush=True)
+        return 0
+
+    rows = []
+    for summary_path in sorted(outputs_dir.glob("*/seed-*_sample-*/summary_confidences.json")):
+        sample_dir = summary_path.parent
+        description = sample_dir.parent.name
+        confidences_path = sample_dir / "confidences.json"
+        with summary_path.open("r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+        confidences = {}
+        if confidences_path.exists():
+            with confidences_path.open("r", encoding="utf-8") as handle:
+                confidences = json.load(handle)
+        pae = interface_pae(summary)
+        rows.append(
+            {
+                "description": description,
+                "ptm": round_or_blank(summary.get("ptm")),
+                "iptm": round_or_blank(summary.get("iptm")),
+                "ranking_score": round_or_blank(summary.get("ranking_score")),
+                "chain_H_plddt": round_or_blank(chain_plddt(confidences, "H")),
+                "chain_T_plddt": round_or_blank(chain_plddt(confidences, "T")),
+                "interface_pae": round_or_blank(pae),
+                "ipsae_H_T": round_or_blank(ipsae_from_pae(pae)),
+            }
+        )
+
+    if not rows:
+        print(f"[AF3Score HPCC adapter] No confidence JSONs found under {outputs_dir}", flush=True)
+        return 0
+
+    metrics_csv.parent.mkdir(parents=True, exist_ok=True)
+    with metrics_csv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[AF3Score HPCC adapter] Fallback wrote {len(rows)} metrics row(s): {metrics_csv}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
+
 cat > "$output_dir/af3score_hpcc_runtime_config.txt" <<EOF
 AF3SCORE_DIR=$AF3SCORE_DIR
 AF3SCORE_PYTHON=$AF3SCORE_PYTHON
@@ -323,4 +454,13 @@ AF3SCORE_MODEL_DIR=$AF3SCORE_MODEL_DIR
 AF3SCORE_FLASH_ATTENTION=$AF3SCORE_FLASH_ATTENTION
 EOF
 
-exec "$runtime_dir/AF3score_pipeline.sh" "$input_pdb_dir" "$output_dir" "$num_jobs"
+set +e
+"$runtime_dir/AF3score_pipeline.sh" "$input_pdb_dir" "$output_dir" "$num_jobs"
+pipeline_status=$?
+set -e
+
+"$AF3SCORE_PYTHON" "$runtime_dir/05_fallback_metrics.py" \
+  "$output_dir/af3score_metrics.csv" \
+  "$output_dir/af3score_outputs"
+
+exit "$pipeline_status"
