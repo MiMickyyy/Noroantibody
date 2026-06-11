@@ -104,6 +104,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--prepare-only", action="store_true")
     p.add_argument("--merge-only", action="store_true")
+    p.add_argument(
+        "--continue-from-condition-index",
+        action="store_true",
+        help="When --condition-index is provided, run that condition and every later condition, skipping completed summaries.",
+    )
     return p.parse_args()
 
 
@@ -980,9 +985,23 @@ def main() -> int:
         merge_outputs(root, args, conditions)
         return 0
 
+    continue_from_index = bool(args.continue_from_condition_index)
+    continue_from_index = continue_from_index or bool(os.environ.get("STAGE1_CONTINUE_FROM_CONDITION_INDEX"))
+    continue_from_index = continue_from_index or (out_root / ".continue_from_condition_index").exists()
+
     selected = conditions
     if args.condition_index is not None:
-        selected = [c for c in conditions if c.condition_index == int(args.condition_index)]
+        idx = int(args.condition_index)
+        if continue_from_index:
+            selected = [c for c in conditions if c.condition_index >= idx]
+            if not selected:
+                raise PipelineError(f"Unknown condition start index: {args.condition_index}")
+            log(
+                "[persistent] condition-index "
+                f"{idx} will run through condition {selected[-1].condition_index} with resume enabled"
+            )
+        else:
+            selected = [c for c in conditions if c.condition_index == idx]
         if not selected:
             raise PipelineError(f"Unknown condition index: {args.condition_index}")
 
