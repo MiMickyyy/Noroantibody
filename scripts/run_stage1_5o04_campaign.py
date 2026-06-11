@@ -44,6 +44,7 @@ from pipeline_common import (  # noqa: E402
 )
 from run_pipeline import (  # noqa: E402
     AF3SCORE_FIELDS,
+    af3score_validation_pass,
     blank_af3score_fields,
     build_target_contig,
     compute_backbone_signature,
@@ -56,6 +57,7 @@ from run_pipeline import (  # noqa: E402
     target_chain_segments,
 )
 from tool_wrappers import (  # noqa: E402
+    _parse_af3score_metric_csv,
     combine_weighted_score,
     load_tool_config,
     run_proteinmpnn_sequence_design,
@@ -764,7 +766,60 @@ def master_fields() -> List[str]:
     ]
 
 
-def read_all_condition_rows(out_root: Path) -> pd.DataFrame:
+def _float_or_none(value) -> Optional[float]:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def reconcile_async_af3score_metrics(df: pd.DataFrame, pipeline_cfg: dict) -> pd.DataFrame:
+    """Promote submitted_async rows to completed when AF3Score metrics are present."""
+    if df.empty or "af3score_status" not in df.columns:
+        return df
+    af3_cfg = pipeline_cfg.get("af3score", {}) or {}
+    weights = af3_cfg.get("ranking_weights", {}) or {}
+    rf2_weight = float(weights.get("rf2", 0.6))
+    af3_weight = float(weights.get("af3score", 0.4))
+    denom = rf2_weight + af3_weight
+    if denom <= 0:
+        rf2_weight, af3_weight, denom = 1.0, 0.0, 1.0
+
+    out = df.copy()
+    for idx, row in out.iterrows():
+        if str(row.get("af3score_status", "")).strip() != "submitted_async":
+            continue
+        metrics_csv = Path(str(row.get("af3score_metric_csv", "") or ""))
+        if not metrics_csv.exists():
+            continue
+        expected = Path(str(row.get("af3score_input_pdb", "") or row.get("candidate_id", ""))).stem
+        try:
+            metrics = _parse_af3score_metric_csv(metrics_csv, expected)
+        except Exception:
+            continue
+
+        rf2_rank = _float_or_none(row.get("rf2_rank_score"))
+        if rf2_rank is None:
+            rf2_rank = _float_or_none(row.get("combined_ranking_score")) or 0.0
+        af3_rank = _float_or_none(metrics.get("af3score_rank_score"))
+        if af3_rank is None:
+            combined = rf2_rank
+        else:
+            combined = (rf2_weight * rf2_rank + af3_weight * af3_rank) / denom
+
+        metrics["rf2_relaxed_pass"] = int(float(row.get("rf2_relaxed_pass") or 0))
+        metrics["af3score_validation_pass"] = af3score_validation_pass(metrics, af3_cfg)
+        metrics["combined_ranking_score"] = round(float(combined), 6)
+        metrics.setdefault("af3score_metric_csv", str(metrics_csv))
+        for key in AF3SCORE_FIELDS:
+            if key in out.columns and key in metrics:
+                out.at[idx, key] = metrics[key]
+    return out
+
+
+def read_all_condition_rows(out_root: Path, pipeline_cfg: dict) -> pd.DataFrame:
     frames = []
     for path in sorted((out_root / "conditions").glob("*/condition_summary_compact.csv")):
         try:
@@ -774,6 +829,7 @@ def read_all_condition_rows(out_root: Path) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame(columns=master_fields())
     df = pd.concat(frames, ignore_index=True)
+    df = reconcile_async_af3score_metrics(df, pipeline_cfg)
     return ensure_combined_score_column(df)
 
 
@@ -788,7 +844,8 @@ def intended_cdr_mode(df: pd.DataFrame) -> pd.Series:
 def merge_outputs(root: Path, args: argparse.Namespace, conditions: Sequence[Stage1Condition]):
     out_root = resolve_path(root, args.output_root)
     ensure_dirs([out_root])
-    df = read_all_condition_rows(out_root)
+    pipeline_cfg = read_yaml(resolve_path(root, args.pipeline_config))
+    df = read_all_condition_rows(out_root, pipeline_cfg)
     if df.empty:
         atomic_write_csv(out_root / "stage1_master_results.csv", [], master_fields())
         return
