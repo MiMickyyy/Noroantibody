@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from itertools import combinations
 import json
 import math
 import os
@@ -44,7 +45,6 @@ from pipeline_common import (  # noqa: E402
 )
 from run_pipeline import (  # noqa: E402
     AF3SCORE_FIELDS,
-    af3score_validation_pass,
     blank_af3score_fields,
     build_target_contig,
     compute_backbone_signature,
@@ -57,7 +57,6 @@ from run_pipeline import (  # noqa: E402
     target_chain_segments,
 )
 from tool_wrappers import (  # noqa: E402
-    _parse_af3score_metric_csv,
     combine_weighted_score,
     load_tool_config,
     run_proteinmpnn_sequence_design,
@@ -71,6 +70,10 @@ MONITOR_CROP_TO_FULL = {48: 272, 49: 273, 53: 277, 238: 462, 239: 463, 240: 464,
 CDR1_RANGE = (23, 34)
 CDR2_RANGE = (50, 58)
 CDR3_RANGE = (97, 106)
+NEXT_HOTSPOT_GROUP1 = ("A271", "A466")
+NEXT_HOTSPOT_GROUP2 = ("A464", "B479")
+NEXT_HOTSPOT_GROUP3 = ("A224", "A272", "B482", "A225")
+NEXT_MONITORING_HOTSPOTS = tuple(dict.fromkeys(NEXT_HOTSPOT_GROUP1 + NEXT_HOTSPOT_GROUP2 + NEXT_HOTSPOT_GROUP3))
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,10 @@ class Stage1Condition:
     design_group: str
     cdr1_length: int
     cdr3_length: int
+    hotspot_tokens: Tuple[str, ...]
+    open_cdr1: bool
+    open_cdr2: bool
+    open_cdr3: bool
     flexible_backbone_regions: str
     length_variable_regions: str
     sequence_design_regions: str
@@ -96,7 +103,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cdr-config", default="data/configs/cdr_boundaries.yaml")
     p.add_argument("--condition-index", type=int, default=None)
     p.add_argument("--max-conditions", type=int, default=None)
-    p.add_argument("--backbones-per-condition", type=int, default=30)
+    p.add_argument("--backbones-per-condition", type=int, default=20)
     p.add_argument("--seqs-per-backbone", type=int, default=1)
     p.add_argument("--limit-backbones", type=int, default=None)
     p.add_argument("--dry-run", action="store_true")
@@ -104,11 +111,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--prepare-only", action="store_true")
     p.add_argument("--merge-only", action="store_true")
-    p.add_argument(
-        "--continue-from-condition-index",
-        action="store_true",
-        help="When --condition-index is provided, run that condition and every later condition, skipping completed summaries.",
-    )
     return p.parse_args()
 
 
@@ -145,49 +147,183 @@ def read_resolved_inputs(root: Path, path: Path) -> dict:
 def build_conditions() -> List[Stage1Condition]:
     rows: List[Stage1Condition] = []
     idx = 0
-    for group, label, flex in [
-        (
-            "cdr13_only",
-            "cdr13_only",
-            "CDR1:23-34;CDR3:97-106",
-        ),
-        (
-            "cdr13_flank_flexible",
-            "cdr13_flank",
-            "CDR1_support:21-36;CDR3_support:95-108",
-        ),
-    ]:
-        for h1_len in range(10, 15):
-            for h3_len in range(8, 13):
-                rows.append(
-                    Stage1Condition(
-                        condition_index=idx,
-                        condition_name=f"5O04_{label}_H1L{h1_len:02d}_H3L{h3_len:02d}",
-                        design_group=group,
-                        cdr1_length=h1_len,
-                        cdr3_length=h3_len,
-                        flexible_backbone_regions=flex,
-                        length_variable_regions="CDR1:23-34;CDR3:97-106",
-                        sequence_design_regions="CDR1:23-34;CDR3:97-106",
-                        fixed_regions="CDR2:50-58;framework_sequence_outside_CDR1_CDR3;antigen",
-                    )
-                )
-                idx += 1
+    for n1 in (1, 2):
+        for g1 in combinations(NEXT_HOTSPOT_GROUP1, n1):
+            for n2 in (1, 2):
+                for g2 in combinations(NEXT_HOTSPOT_GROUP2, n2):
+                    for n3 in range(0, len(NEXT_HOTSPOT_GROUP3) + 1):
+                        for g3 in combinations(NEXT_HOTSPOT_GROUP3, n3):
+                            tokens = tuple(g1 + g2 + g3)
+                            if len(tokens) > 6:
+                                continue
+                            open_cdr1 = bool({"A271", "A272", "A464", "B464"} & set(tokens))
+                            open_cdr3 = bool({"A466", "A224", "A464", "B464"} & set(tokens))
+                            open_cdr2 = "B479" in tokens and "B482" in tokens
+                            open_regions = []
+                            if open_cdr1:
+                                open_regions.append("CDR1:23-34")
+                            if open_cdr2:
+                                open_regions.append("CDR2:50-58")
+                            if open_cdr3:
+                                open_regions.append("CDR3:97-106")
+                            fixed = []
+                            if not open_cdr1:
+                                fixed.append("CDR1:23-34")
+                            if not open_cdr2:
+                                fixed.append("CDR2:50-58")
+                            if not open_cdr3:
+                                fixed.append("CDR3:97-106")
+                            fixed.append("framework_sequence_outside_open_CDRs")
+                            fixed.append("antigen")
+                            hotspot_label = "_".join(tokens)
+                            cdr_label = "".join(
+                                [
+                                    "H1" if open_cdr1 else "",
+                                    "H2" if open_cdr2 else "",
+                                    "H3" if open_cdr3 else "",
+                                ]
+                            ) or "none"
+                            condition_name = f"baker_hs{idx:03d}_{cdr_label}_{hotspot_label}"
+                            rows.append(
+                                Stage1Condition(
+                                    condition_index=idx,
+                                    condition_name=condition_name,
+                                    design_group="baker_avg5_hotspot_combo",
+                                    cdr1_length=12,
+                                    cdr3_length=10,
+                                    hotspot_tokens=tokens,
+                                    open_cdr1=open_cdr1,
+                                    open_cdr2=open_cdr2,
+                                    open_cdr3=open_cdr3,
+                                    flexible_backbone_regions=";".join(open_regions),
+                                    length_variable_regions=";".join(
+                                        r for r in ["CDR1:10-14" if open_cdr1 else "", "CDR3:10-14" if open_cdr3 else ""] if r
+                                    ),
+                                    sequence_design_regions=";".join(open_regions),
+                                    fixed_regions=";".join(fixed),
+                                )
+                            )
+                            idx += 1
+    if len(rows) != 135:
+        raise PipelineError(f"Expected 135 hotspot combinations, got {len(rows)}")
     return rows
+
+
+def canonical_hotspot_token(token: str) -> str:
+    token = str(token).strip().upper()
+    # User shorthand/typo guard: all A479 references in this experiment mean B479.
+    if token == "A479":
+        return "B479"
+    return token
+
+
+def hotspot_key(token: str) -> Tuple[str, int]:
+    token = canonical_hotspot_token(token)
+    if len(token) < 2 or not token[0].isalpha() or not token[1:].isdigit():
+        raise PipelineError(f"Invalid hotspot token: {token}")
+    return token[0], int(token[1:])
+
+
+def hotspot_tokens_to_keys(tokens: Sequence[str]) -> Tuple[Tuple[str, int], ...]:
+    out = []
+    seen = set()
+    for token in tokens:
+        key = hotspot_key(token)
+        if key not in seen:
+            out.append(key)
+            seen.add(key)
+    return tuple(out)
+
+
+def hotspot_keys_to_tokens(keys: Iterable[Tuple[str, int]]) -> List[str]:
+    return [f"{chain}{resnum}" for chain, resnum in sorted(set(keys), key=lambda x: (x[0], x[1]))]
+
+
+def weighted_length_schedule(total: int, weights: Dict[int, float], seed_base: int, key: str) -> List[int]:
+    if total <= 0:
+        return []
+    normalized = {int(k): float(v) for k, v in weights.items() if float(v) > 0}
+    if not normalized:
+        raise PipelineError("Length schedule weights are empty.")
+    weight_sum = sum(normalized.values())
+    raw = {length: (weight / weight_sum) * total for length, weight in normalized.items()}
+    counts = {length: int(math.floor(value)) for length, value in raw.items()}
+    remainder = total - sum(counts.values())
+    if remainder > 0:
+        ranked = sorted(raw, key=lambda length: (raw[length] - counts[length], normalized[length], -length), reverse=True)
+        for length in ranked[:remainder]:
+            counts[length] += 1
+    schedule: List[int] = []
+    for length in sorted(counts):
+        schedule.extend([length] * counts[length])
+    rng = deterministic_rng(seed_base, key)
+    rng.shuffle(schedule)
+    return schedule
+
+
+def candidate_length_plan(condition: Stage1Condition, cdr, total: int, seed_base: int) -> List[Tuple[int, int]]:
+    if condition.open_cdr1:
+        h1 = weighted_length_schedule(
+            total,
+            {10: 0.10, 11: 0.10, 12: 0.60, 13: 0.10, 14: 0.10},
+            seed_base,
+            f"{condition.condition_name}:h1",
+        )
+    else:
+        h1 = [int(cdr.h1_len)] * total
+
+    if condition.open_cdr3:
+        h3 = weighted_length_schedule(
+            total,
+            {10: 0.20, 11: 0.20, 12: 0.20, 13: 0.20, 14: 0.20},
+            seed_base,
+            f"{condition.condition_name}:h3",
+        )
+    else:
+        h3 = [int(cdr.h3_len)] * total
+    return list(zip(h1, h3))
+
+
+def design_loop_specs(condition: Stage1Condition, h1_len: int, h2_len: int, h3_len: int) -> Tuple[str, str]:
+    rf_loops = []
+    mpnn_loops = []
+    if condition.open_cdr1:
+        rf_loops.append(f"H1:{h1_len}")
+        mpnn_loops.append("H1")
+    if condition.open_cdr2:
+        rf_loops.append(f"H2:{h2_len}")
+        mpnn_loops.append("H2")
+    if condition.open_cdr3:
+        rf_loops.append(f"H3:{h3_len}")
+        mpnn_loops.append("H3")
+    if not rf_loops:
+        raise PipelineError(f"No open CDR region for condition {condition.condition_name}")
+    return ",".join(rf_loops), ",".join(mpnn_loops)
 
 
 def write_run_configs(root: Path, out_root: Path, conditions: Sequence[Stage1Condition], args: argparse.Namespace):
     cfg_dir = out_root / "configs"
     ensure_dirs([cfg_dir])
+    manifest_rows = []
+    for c in conditions:
+        row = dict(c.__dict__)
+        row["hotspot_tokens"] = ";".join(c.hotspot_tokens)
+        row["backbones_per_condition"] = args.backbones_per_condition
+        row["sequences_per_backbone"] = args.seqs_per_backbone
+        manifest_rows.append(row)
     atomic_write_csv(
         out_root / "run_manifest.csv",
-        [c.__dict__ | {"backbones_per_condition": args.backbones_per_condition, "sequences_per_backbone": args.seqs_per_backbone} for c in conditions],
+        manifest_rows,
         [
             "condition_index",
             "condition_name",
             "design_group",
             "cdr1_length",
             "cdr3_length",
+            "hotspot_tokens",
+            "open_cdr1",
+            "open_cdr2",
+            "open_cdr3",
             "flexible_backbone_regions",
             "length_variable_regions",
             "sequence_design_regions",
@@ -359,10 +495,29 @@ def cdr_index_sets(parts: dict, h1_len: int, h3_len: int) -> Tuple[set, set, set
     return set(range(h1_start, h1_end)), set(range(h2_start, h2_end)), set(range(h3_start, h3_end))
 
 
-def compute_5o04_contacts(pdb_path: Path, parts: dict, h1_len: int, h3_len: int, cutoff: float = 5.0) -> dict:
+def compute_5o04_contacts(
+    pdb_path: Path,
+    parts: dict,
+    h1_len: int,
+    h3_len: int,
+    selected_hotspot_tokens: Sequence[str],
+    monitoring_hotspot_tokens: Sequence[str] = NEXT_MONITORING_HOTSPOTS,
+    cutoff: float = 5.0,
+) -> dict:
+    selected_keys = set(hotspot_tokens_to_keys(selected_hotspot_tokens))
+    monitoring_keys = set(hotspot_tokens_to_keys(monitoring_hotspot_tokens))
     base = {
         "contact_count_to_core_hotspots": 0,
         "contact_count_to_monitoring_epitope": 0,
+        "selected_hotspot_total": len(selected_keys),
+        "selected_hotspot_contacts": "",
+        "selected_hotspot_exact_contact_count": 0,
+        "selected_hotspot_residue_contact_count": 0,
+        "monitoring_hotspot_total": len(monitoring_keys),
+        "monitoring_hotspot_contacts": "",
+        "monitoring_hotspot_exact_contact_count": 0,
+        "monitoring_hotspot_residue_contact_count": 0,
+        "target_chain_ids": "",
         "cdr1_contact_count": 0,
         "cdr2_contact_count": 0,
         "cdr3_contact_count": 0,
@@ -400,6 +555,8 @@ def compute_5o04_contacts(pdb_path: Path, parts: dict, h1_len: int, h3_len: int,
     target_res = [(cid, r) for cid, residues in chains.items() if cid != binder_chain for r in residues]
     if not target_res:
         return base
+    target_chain_ids = {cid for cid, _ in target_res}
+    base["target_chain_ids"] = ";".join(sorted(target_chain_ids))
 
     h1_idx, h2_idx, h3_idx = cdr_index_sets(parts, h1_len, h3_len)
     cdr_contact_targets = {"cdr1": set(), "cdr2": set(), "cdr3": set()}
@@ -424,8 +581,24 @@ def compute_5o04_contacts(pdb_path: Path, parts: dict, h1_len: int, h3_len: int,
     core_full = set(CORE_CROP_TO_FULL.values())
     monitor_full = set(MONITOR_CROP_TO_FULL.values())
     contacted_full_nums = {resnum for _, resnum in target_contacted_by_cdr}
-    base["contact_count_to_core_hotspots"] = len({x for x in target_contacted_by_cdr if x[1] in core_full})
-    base["contact_count_to_monitoring_epitope"] = len({x for x in target_contacted_by_cdr if x[1] in monitor_full})
+
+    selected_exact = selected_keys & target_contacted_by_cdr
+    monitoring_exact = monitoring_keys & target_contacted_by_cdr
+    selected_by_residue = {key for key in selected_keys if key[1] in contacted_full_nums}
+    monitoring_by_residue = {key for key in monitoring_keys if key[1] in contacted_full_nums}
+    selected_chain_available = bool({chain for chain, _ in selected_keys} & target_chain_ids)
+    monitoring_chain_available = bool({chain for chain, _ in monitoring_keys} & target_chain_ids)
+
+    selected_for_score = selected_exact if selected_chain_available else selected_by_residue
+    monitoring_for_score = monitoring_exact if monitoring_chain_available else monitoring_by_residue
+    base["selected_hotspot_contacts"] = ";".join(hotspot_keys_to_tokens(selected_for_score))
+    base["selected_hotspot_exact_contact_count"] = len(selected_exact)
+    base["selected_hotspot_residue_contact_count"] = len(selected_by_residue)
+    base["monitoring_hotspot_contacts"] = ";".join(hotspot_keys_to_tokens(monitoring_for_score))
+    base["monitoring_hotspot_exact_contact_count"] = len(monitoring_exact)
+    base["monitoring_hotspot_residue_contact_count"] = len(monitoring_by_residue)
+    base["contact_count_to_core_hotspots"] = len(selected_for_score)
+    base["contact_count_to_monitoring_epitope"] = len(monitoring_for_score)
     for crop, full in {**MONITOR_CROP_TO_FULL, **CORE_CROP_TO_FULL}.items():
         base[f"contacts_to_crop_{crop}"] = len({x for x in target_contacted_by_cdr if x[1] == full})
 
@@ -443,8 +616,8 @@ def compute_5o04_contacts(pdb_path: Path, parts: dict, h1_len: int, h3_len: int,
     base["cdr3_support_flag"] = int(c3 > 0)
     base["cdr2_low_contact_flag"] = int(c2 <= max(1, int(0.25 * total_cdr_contacts)))
 
-    core_frac = len(contacted_full_nums & core_full) / max(1, len(core_full))
-    monitor_frac = len(contacted_full_nums & monitor_full) / max(1, len(monitor_full))
+    core_frac = len(selected_for_score) / max(1, len(selected_keys))
+    monitor_frac = len(monitoring_for_score) / max(1, len(monitoring_keys))
     cdr_mode = (
         0.45 * base["cdr1_contact_fraction"]
         + 0.30 * min(1.0, base["cdr3_contact_fraction"] / 0.35)
@@ -540,14 +713,19 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
 
     backbone_count = int(args.limit_backbones or args.backbones_per_condition)
     seqs_per_backbone = int(args.seqs_per_backbone)
-    hotspot_tokens = [f"{chain}{resnum}" for chain in ("A", "B") for resnum in CORE_CROP_TO_FULL.values()]
+    if seqs_per_backbone != 1:
+        raise PipelineError("This Baker hotspot matrix expects --seqs-per-backbone 1 so each design has its own loop lengths.")
+    length_plan = candidate_length_plan(condition, cdr, backbone_count, seed_base)
+    hotspot_tokens = [canonical_hotspot_token(token) for token in condition.hotspot_tokens]
     backbones_dir = condition_dir / "backbones"
     mpnn_dir = condition_dir / "mpnn_aux"
     rf2_dir = condition_dir / "rf2_metrics"
     ensure_dirs([backbones_dir, mpnn_dir, rf2_dir])
 
     for i in range(1, backbone_count + 1):
-        bb_id = f"{condition.condition_name}_bb{i:03d}"
+        h1_len, h3_len = length_plan[i - 1]
+        rf_design_loops, mpnn_loops = design_loop_specs(condition, h1_len, cdr.h2_len, h3_len)
+        bb_id = f"{condition.condition_name}_H1L{h1_len:02d}_H3L{h3_len:02d}_bb{i:03d}"
         expected_cids = {f"{bb_id}_s{sidx:02d}" for sidx in range(1, seqs_per_backbone + 1)}
         if expected_cids and expected_cids.issubset(completed_ids):
             continue
@@ -556,10 +734,10 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
             cfg=tooling,
             combo={
                 "condition_name": condition.condition_name,
-                "campaign_name": "5O04_WT_like_hotspot_transfer",
-                "h1_length": condition.cdr1_length,
+                "campaign_name": "Baker_avg5_hotspot_combo_2700",
+                "h1_length": h1_len,
                 "h2_length": cdr.h2_len,
-                "h3_length": condition.cdr3_length,
+                "h3_length": h3_len,
             },
             backbone_id=bb_id,
             target_pdb=target_pdb,
@@ -571,13 +749,13 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
             + cdr.h2_len
             + len(parts["framework_between_h2_h3"])
             + len(parts["framework_suffix"])
-            + condition.cdr1_length
-            + condition.cdr3_length,
+            + h1_len
+            + h3_len,
             out_pdb=bb_pdb,
             seed=seed_base,
             log_file=logs_dir / "rfdiffusion.log",
             dry_run=dry_run,
-            design_loops=f"H1:{condition.cdr1_length},H3:{condition.cdr3_length}",
+            design_loops=rf_design_loops,
         )
         mpnn_records = run_proteinmpnn_sequence_design(
             cfg=tooling,
@@ -586,7 +764,7 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
             seed=seed_base,
             dry_run=dry_run,
             log_file=logs_dir / "proteinmpnn.log",
-            loops="H1,H3",
+            loops=mpnn_loops,
             seqs_per_struct=seqs_per_backbone,
             temperature=0.1,
         )
@@ -601,12 +779,12 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
             designed_pdb = Path(record.get("designed_pdb", str(bb_pdb)))
             full_seq = str(record.get("full_sequence", "")).strip().upper()
             try:
-                h1_seq, h2_seq, h3_seq = split_designed_sequence(parts, full_seq, condition.cdr1_length, condition.cdr3_length)
+                h1_seq, h2_seq, h3_seq = split_designed_sequence(parts, full_seq, h1_len, h3_len)
             except Exception:
                 rng = deterministic_rng(seed_base, cid)
-                h1_seq = "".join(rng.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(condition.cdr1_length))
+                h1_seq = "".join(rng.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(h1_len))
                 h2_seq = parts["h2_native"]
-                h3_seq = "".join(rng.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(condition.cdr3_length))
+                h3_seq = "".join(rng.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(h3_len))
 
             rf2_json = rf2_dir / f"{cid}_rf2.json"
             metrics = run_rf2_filter(
@@ -617,19 +795,28 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
                 dry_run=dry_run,
                 log_file=logs_dir / "rf2.log",
                 seed=seed_base,
-                context={"candidate_id": cid, "campaign_name": "5O04_WT_like_hotspot_transfer", "cdr3_contact_bias": 1},
+                context={"candidate_id": cid, "campaign_name": "Baker_avg5_hotspot_combo_2700", "cdr3_contact_bias": int(condition.open_cdr3)},
             )
             structure_for_contacts = Path(str(metrics.get("rf2_best_pdb") or designed_pdb))
-            contacts = compute_5o04_contacts(structure_for_contacts, parts, condition.cdr1_length, condition.cdr3_length)
+            contacts = compute_5o04_contacts(
+                structure_for_contacts,
+                parts,
+                h1_len,
+                h3_len,
+                selected_hotspot_tokens=hotspot_tokens,
+                monitoring_hotspot_tokens=NEXT_MONITORING_HOTSPOTS,
+            )
             metrics.update(contacts)
             strict_pass = hard_pass(metrics, filter_cfg)
             relaxed_pass = relaxed_surrogate_pass(metrics, filter_cfg)
+            selected_total = max(1, int(contacts.get("selected_hotspot_total") or 0))
+            monitoring_total = max(1, int(contacts.get("monitoring_hotspot_total") or 0))
             rf2_rank = combine_weighted_score(
                 {
                     "rf2_pae": metrics.get("rf2_pae", 99.0),
                     "design_rf2_rmsd": metrics.get("design_rf2_rmsd", 99.0),
-                    "hotspot_agreement": min(1.0, contacts["contact_count_to_core_hotspots"] / max(1, len(CORE_CROP_TO_FULL) * 2)),
-                    "groove_localization": min(1.0, contacts["contact_count_to_monitoring_epitope"] / max(1, len(MONITOR_CROP_TO_FULL) * 2)),
+                    "hotspot_agreement": min(1.0, contacts["contact_count_to_core_hotspots"] / selected_total),
+                    "groove_localization": min(1.0, contacts["contact_count_to_monitoring_epitope"] / monitoring_total),
                     "h1_h3_role_consistency": 1.0 if contacts["cdr1_dominant_flag"] and contacts["cdr3_support_flag"] else 0.0,
                     "structural_plausibility": metrics.get("structural_plausibility", 0.0),
                 },
@@ -671,8 +858,12 @@ def run_condition(root: Path, args: argparse.Namespace, condition: Stage1Conditi
             row = {
                 "condition_name": condition.condition_name,
                 "design_group": condition.design_group,
-                "cdr1_length": condition.cdr1_length,
-                "cdr3_length": condition.cdr3_length,
+                "hotspot_tokens": ";".join(hotspot_tokens),
+                "open_cdr1": int(condition.open_cdr1),
+                "open_cdr2": int(condition.open_cdr2),
+                "open_cdr3": int(condition.open_cdr3),
+                "cdr1_length": h1_len,
+                "cdr3_length": h3_len,
                 "backbone_id": bb_id,
                 "sequence_id": f"s{sidx:02d}",
                 "candidate_id": cid,
@@ -717,6 +908,10 @@ def master_fields() -> List[str]:
     return [
         "condition_name",
         "design_group",
+        "hotspot_tokens",
+        "open_cdr1",
+        "open_cdr2",
+        "open_cdr3",
         "cdr1_length",
         "cdr3_length",
         "backbone_id",
@@ -737,6 +932,15 @@ def master_fields() -> List[str]:
         "combined_ranking_score",
         "contact_count_to_core_hotspots",
         "contact_count_to_monitoring_epitope",
+        "selected_hotspot_total",
+        "selected_hotspot_contacts",
+        "selected_hotspot_exact_contact_count",
+        "selected_hotspot_residue_contact_count",
+        "monitoring_hotspot_total",
+        "monitoring_hotspot_contacts",
+        "monitoring_hotspot_exact_contact_count",
+        "monitoring_hotspot_residue_contact_count",
+        "target_chain_ids",
         "contacts_to_crop_49",
         "contacts_to_crop_53",
         "contacts_to_crop_238",
@@ -771,60 +975,7 @@ def master_fields() -> List[str]:
     ]
 
 
-def _float_or_none(value) -> Optional[float]:
-    try:
-        if value is None or str(value).strip() == "":
-            return None
-        return float(value)
-    except Exception:
-        return None
-
-
-def reconcile_async_af3score_metrics(df: pd.DataFrame, pipeline_cfg: dict) -> pd.DataFrame:
-    """Promote submitted_async rows to completed when AF3Score metrics are present."""
-    if df.empty or "af3score_status" not in df.columns:
-        return df
-    af3_cfg = pipeline_cfg.get("af3score", {}) or {}
-    weights = af3_cfg.get("ranking_weights", {}) or {}
-    rf2_weight = float(weights.get("rf2", 0.6))
-    af3_weight = float(weights.get("af3score", 0.4))
-    denom = rf2_weight + af3_weight
-    if denom <= 0:
-        rf2_weight, af3_weight, denom = 1.0, 0.0, 1.0
-
-    out = df.copy()
-    for idx, row in out.iterrows():
-        if str(row.get("af3score_status", "")).strip() != "submitted_async":
-            continue
-        metrics_csv = Path(str(row.get("af3score_metric_csv", "") or ""))
-        if not metrics_csv.exists():
-            continue
-        expected = Path(str(row.get("af3score_input_pdb", "") or row.get("candidate_id", ""))).stem
-        try:
-            metrics = _parse_af3score_metric_csv(metrics_csv, expected)
-        except Exception:
-            continue
-
-        rf2_rank = _float_or_none(row.get("rf2_rank_score"))
-        if rf2_rank is None:
-            rf2_rank = _float_or_none(row.get("combined_ranking_score")) or 0.0
-        af3_rank = _float_or_none(metrics.get("af3score_rank_score"))
-        if af3_rank is None:
-            combined = rf2_rank
-        else:
-            combined = (rf2_weight * rf2_rank + af3_weight * af3_rank) / denom
-
-        metrics["rf2_relaxed_pass"] = int(float(row.get("rf2_relaxed_pass") or 0))
-        metrics["af3score_validation_pass"] = af3score_validation_pass(metrics, af3_cfg)
-        metrics["combined_ranking_score"] = round(float(combined), 6)
-        metrics.setdefault("af3score_metric_csv", str(metrics_csv))
-        for key in AF3SCORE_FIELDS:
-            if key in out.columns and key in metrics:
-                out.at[idx, key] = metrics[key]
-    return out
-
-
-def read_all_condition_rows(out_root: Path, pipeline_cfg: dict) -> pd.DataFrame:
+def read_all_condition_rows(out_root: Path) -> pd.DataFrame:
     frames = []
     for path in sorted((out_root / "conditions").glob("*/condition_summary_compact.csv")):
         try:
@@ -834,7 +985,6 @@ def read_all_condition_rows(out_root: Path, pipeline_cfg: dict) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame(columns=master_fields())
     df = pd.concat(frames, ignore_index=True)
-    df = reconcile_async_af3score_metrics(df, pipeline_cfg)
     return ensure_combined_score_column(df)
 
 
@@ -849,8 +999,7 @@ def intended_cdr_mode(df: pd.DataFrame) -> pd.Series:
 def merge_outputs(root: Path, args: argparse.Namespace, conditions: Sequence[Stage1Condition]):
     out_root = resolve_path(root, args.output_root)
     ensure_dirs([out_root])
-    pipeline_cfg = read_yaml(resolve_path(root, args.pipeline_config))
-    df = read_all_condition_rows(out_root, pipeline_cfg)
+    df = read_all_condition_rows(out_root)
     if df.empty:
         atomic_write_csv(out_root / "stage1_master_results.csv", [], master_fields())
         return
@@ -869,12 +1018,20 @@ def merge_outputs(root: Path, args: argparse.Namespace, conditions: Sequence[Sta
         "cdr2_contact_fraction",
         "cdr3_contact_fraction",
         "contact_count_to_core_hotspots",
+        "contact_count_to_monitoring_epitope",
+        "selected_hotspot_total",
+        "selected_hotspot_exact_contact_count",
+        "selected_hotspot_residue_contact_count",
+        "monitoring_hotspot_total",
+        "monitoring_hotspot_exact_contact_count",
+        "monitoring_hotspot_residue_contact_count",
     ]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df["intended_cdr_mode_flag"] = intended_cdr_mode(df).astype(int)
-    core_norm = pd.to_numeric(df.get("contact_count_to_core_hotspots", 0), errors="coerce").fillna(0) / max(1, len(CORE_CROP_TO_FULL) * 2)
+    selected_total = pd.to_numeric(df.get("selected_hotspot_total", 1), errors="coerce").fillna(1).clip(lower=1)
+    core_norm = pd.to_numeric(df.get("contact_count_to_core_hotspots", 0), errors="coerce").fillna(0) / selected_total
     wt = pd.to_numeric(df.get("wt_like_interface_recovery_score", 0), errors="coerce").fillna(0)
     combined = pd.to_numeric(df.get("combined_ranking_score", 0), errors="coerce").fillna(0)
     mode = df["intended_cdr_mode_flag"].fillna(0)
@@ -892,7 +1049,19 @@ def merge_outputs(root: Path, args: argparse.Namespace, conditions: Sequence[Sta
     df.sort_values(["condition_name", "balanced_selection_score", "combined_ranking_score"], ascending=[True, False, False]).groupby("condition_name", as_index=False).head(1).to_csv(out_root / "stage1_per_condition_best.csv", index=False)
 
     summary = (
-        df.groupby(["condition_name", "design_group", "cdr1_length", "cdr3_length"], as_index=False)
+        df.groupby(
+            [
+                "condition_name",
+                "design_group",
+                "hotspot_tokens",
+                "open_cdr1",
+                "open_cdr2",
+                "open_cdr3",
+                "cdr1_length",
+                "cdr3_length",
+            ],
+            as_index=False,
+        )
         .agg(
             total_generated=("candidate_id", "count"),
             rf2_strict_count=("rf2_strict_pass", "sum"),
@@ -910,6 +1079,8 @@ def merge_outputs(root: Path, args: argparse.Namespace, conditions: Sequence[Sta
             mean_cdr1_contact_fraction=("cdr1_contact_fraction", "mean"),
             mean_cdr2_contact_fraction=("cdr2_contact_fraction", "mean"),
             mean_cdr3_contact_fraction=("cdr3_contact_fraction", "mean"),
+            mean_selected_hotspot_contacts=("contact_count_to_core_hotspots", "mean"),
+            mean_monitoring_hotspot_contacts=("contact_count_to_monitoring_epitope", "mean"),
             intended_cdr_mode_count=("intended_cdr_mode_flag", "sum"),
         )
         .sort_values(["mean_wt_like_interface_recovery_score", "mean_combined_ranking_score"], ascending=[False, False])
@@ -924,13 +1095,13 @@ def write_readme(root: Path, out_root: Path, args: argparse.Namespace, condition
     lines = [
         SAFETY_ETHICS_STATEMENT,
         "",
-        "# Stage1 5O04 Hotspot Transfer Run Summary",
+        "# Stage1 Baker Avg5 Hotspot Combo Run Summary",
         "",
         f"- Date/time: {now_iso()}",
         f"- Git commit hash: `{git_commit(root)}`",
-        f"- Exact command template: `python scripts/run_stage1_5o04_campaign.py --execute --condition-index <0-49>`",
+        "- Exact command template: `python scripts/run_stage1_5o04_campaign.py --execute --output-root outputs/stage1_baker_hotspot_2700_full_af3 --pipeline-config data/configs/stage1_5o04/pipeline.stage1_baker_hotspot_2700.yaml --backbones-per-condition 20 --seqs-per-backbone 1`",
         f"- AF3Score command_prefix: `{af3_prefix}`",
-        "- HPCC environment notes: one condition per Slurm task; array throttle should be `%1`; requested memory should not exceed 50 GB.",
+        "- HPCC environment notes: persistent one-GPU worker; do not pass `--condition-index`; the job should keep the same allocation and run all 135 hotspot combinations sequentially.",
         f"- Number of conditions: {len(conditions)}",
         f"- Planned designs: {len(conditions) * int(args.backbones_per_condition) * int(args.seqs_per_backbone)}",
         f"- Completed candidate rows currently merged: {int(df.shape[0])}",
@@ -950,10 +1121,13 @@ def write_readme(root: Path, out_root: Path, args: argparse.Namespace, condition
         f"- `{out_root / 'stage1_per_condition_best.csv'}`",
         "",
         "## Numbering sanity check",
-        "- This run uses full VP1 residue numbering in the full cleaned P-domain target because the old cropped target does not contain the new 5O04 hotspot residues.",
-        "- Core hotspot full VP1 residues: 273, 277, 462, 465, 467.",
-        "- Monitoring full VP1 residues: 272, 273, 277, 462, 463, 464, 465, 467.",
-        "- Contact output columns are labeled by requested cropped positions for review compatibility.",
+        "- This run uses full VP1 residue numbering in the full cleaned P-domain dimer target.",
+        "- Hotspot group 1: A271/A466, choose 1-2.",
+        "- Hotspot group 2: A464/B479, choose 1-2. Any A479 shorthand is canonicalized to B479.",
+        "- Hotspot group 3: A224/A272/B482/A225, choose 0-4.",
+        "- Total hotspot count per condition is capped at 6, yielding 135 combinations.",
+        "- CDR opening: A271 or A272 opens CDR1; A466 or A224 opens CDR3; A464 opens CDR1 and CDR3; B479+B482 additionally opens CDR2 without length change.",
+        "- CDR1 open length distribution: 10/11/13/14 each 10%, length 12 at 60%; CDR3 open length distribution: 10-14 uniform.",
         "",
         "## Cleanup policy",
         "- cleanup_mode: after_each_condition",
@@ -985,23 +1159,9 @@ def main() -> int:
         merge_outputs(root, args, conditions)
         return 0
 
-    continue_from_index = bool(args.continue_from_condition_index)
-    continue_from_index = continue_from_index or bool(os.environ.get("STAGE1_CONTINUE_FROM_CONDITION_INDEX"))
-    continue_from_index = continue_from_index or (out_root / ".continue_from_condition_index").exists()
-
     selected = conditions
     if args.condition_index is not None:
-        idx = int(args.condition_index)
-        if continue_from_index:
-            selected = [c for c in conditions if c.condition_index >= idx]
-            if not selected:
-                raise PipelineError(f"Unknown condition start index: {args.condition_index}")
-            log(
-                "[persistent] condition-index "
-                f"{idx} will run through condition {selected[-1].condition_index} with resume enabled"
-            )
-        else:
-            selected = [c for c in conditions if c.condition_index == idx]
+        selected = [c for c in conditions if c.condition_index == int(args.condition_index)]
         if not selected:
             raise PipelineError(f"Unknown condition index: {args.condition_index}")
 

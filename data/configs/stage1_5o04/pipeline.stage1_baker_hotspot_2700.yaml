@@ -1,0 +1,108 @@
+project:
+  name: "stage1_baker_avg5_hotspot_combo_2700"
+  random_seed: 20260617
+  gpu:
+    type: "H100_or_A100"
+    count: 1
+
+inputs:
+  vp1_sequence_file: "VP1.prot"
+  p_domain_dimer_sequence_file: "P-domain dimer.prot"
+  nanobody_sequence_file: "Nanobody.fa"
+  nanobody_framework_pdb_file: "data/raw/sanitized/Nanobody_HLT.pdb"
+  local_antigen_structure_file: "data/target/antigen_full_cleaned_AB.pdb"
+
+target_prep:
+  antigen_chain_ids: [A, B]
+  numbering_mode: "full_vp1"
+  note: "Baker-style avg5 hotspot matrix on the full cleaned P-domain dimer target."
+
+stage1_baker_hotspot:
+  hotspot_group_1:
+    tokens: [A271, A466]
+    choose_min: 1
+    choose_max: 2
+  hotspot_group_2:
+    tokens: [A464, B479]
+    choose_min: 1
+    choose_max: 2
+    note: "A479 shorthand is canonicalized to B479."
+  hotspot_group_3:
+    tokens: [A224, A272, B482, A225]
+    choose_min: 0
+    choose_max: 4
+  max_hotspots_per_condition: 6
+  expected_conditions: 135
+  backbones_per_condition: 20
+  sequences_per_backbone: 1
+  expected_designs: 2700
+  cdr_opening_rules:
+    cdr1: "Open if A271, A272, or A464 is selected."
+    cdr3: "Open if A466, A224, or A464 is selected."
+    cdr2: "Open only if B479 and B482 are both selected; length remains native."
+  cdr1_open_length_distribution:
+    10: 0.10
+    11: 0.10
+    12: 0.60
+    13: 0.10
+    14: 0.10
+  cdr3_open_length_distribution:
+    10: 0.20
+    11: 0.20
+    12: 0.20
+    13: 0.20
+    14: 0.20
+  scientific_goal: "Systematic dimer-chain-specific hotspot matrix using Baker-style avg5 hotspot selection, with CDR1/CDR3 length exploration and asynchronous AF3 validation."
+
+execution:
+  dry_run_default: false
+  resume_default: true
+  max_gpu_parallel_jobs: 1
+  fail_fast: false
+  memory_safe:
+    cleanup_mode: "after_each_condition"
+    retain_failed_relaxed: "metadata_only"
+    retain_rf2_relaxed_pass: "required_inputs_and_metrics"
+    retain_top_structures: true
+    retain_all_raw_intermediates: false
+    max_memory_gb: 50
+
+filters:
+  hard_thresholds:
+    rf2_pae_max: 10.0
+    design_rf2_rmsd_max: 2.0
+  relaxed_thresholds:
+    rf2_pae_max: 12.0
+    design_rf2_rmsd_max: 2.5
+  ranking_weights:
+    rf2_self_consistency: 0.40
+    hotspot_agreement: 0.25
+    docking_localization: 0.20
+    structural_plausibility: 0.10
+    h1_h3_role_consistency: 0.05
+
+af3score:
+  enabled: true
+  score_relaxed_only: true
+  async_submit: true
+  async_submit_script: "scripts/slurm/stage1_5o04_af3score_async.sbatch"
+  async_partition: "short_gpu"
+  async_qos: "short_gpu"
+  async_time: "02:00:00"
+  async_gres: "gpu:a100:1"
+  async_cuda_module: "cuda/12.8"
+  async_flash_attention: "xla"
+  ranking_weights:
+    rf2: 0.60
+    af3score: 0.40
+  validation_thresholds:
+    ptm_min:
+    iptm_min:
+    plddt_min:
+    pae_max:
+    ipsae_min:
+    rank_score_min:
+
+postprocess:
+  sequence_dedup_identity_threshold: 0.95
+  structural_clustering_enabled: false
