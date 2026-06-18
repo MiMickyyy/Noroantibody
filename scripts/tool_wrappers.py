@@ -274,6 +274,14 @@ def _best_rf2_pdb(output_dir: Path, input_stem: str) -> Optional[Path]:
     return cands[0] if cands else None
 
 
+def _best_rf2_pdb_strict(output_dir: Path, input_stem: str) -> Optional[Path]:
+    direct = output_dir / f"{input_stem}_best.pdb"
+    if direct.exists():
+        return direct
+    matches = sorted(output_dir.glob(f"{input_stem}*_best.pdb"))
+    return matches[0] if matches else None
+
+
 def _append_log_line(log_path: Path, message: str):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as handle:
@@ -632,6 +640,119 @@ def run_proteinmpnn_sequence_design(
     return records
 
 
+def run_proteinmpnn_batch_sequence_design(
+    cfg: ToolConfig,
+    backbone_pdbs: Sequence[Path],
+    out_dir: Path,
+    seed: int,
+    dry_run: bool,
+    log_file: Path,
+    loops: str,
+    seqs_per_struct: int,
+    temperature: float = 0.1,
+) -> Dict[str, List[dict]]:
+    """Run ProteinMPNN once for a batch of backbone PDBs.
+
+    Returns records keyed by the original backbone stem. The single-structure
+    wrapper is kept for older code paths; this batch form avoids repeated
+    ProteinMPNN process/model startup for each condition.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    backbone_pdbs = [Path(p) for p in backbone_pdbs]
+    if not backbone_pdbs:
+        return {}
+
+    if dry_run or not cfg.execute_real_tools:
+        return {
+            p.stem: run_proteinmpnn_sequence_design(
+                cfg=cfg,
+                backbone_pdb=p,
+                out_dir=out_dir / p.stem,
+                seed=seed,
+                dry_run=True,
+                log_file=log_file,
+                loops=loops,
+                seqs_per_struct=seqs_per_struct,
+                temperature=temperature,
+            )
+            for p in backbone_pdbs
+        }
+
+    if not cfg.proteinmpnn_prefix:
+        raise PipelineError("execute_real_tools=true but proteinmpnn.command_prefix is empty")
+
+    input_dir = out_dir / "batch_input"
+    output_dir = out_dir / "batch_outputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for backbone_pdb in backbone_pdbs:
+        if not backbone_pdb.exists():
+            raise PipelineError(f"ProteinMPNN batch input backbone missing: {backbone_pdb}")
+        input_copy = input_dir / f"{backbone_pdb.stem}.pdb"
+        if not input_copy.exists() or input_copy.stat().st_mtime < backbone_pdb.stat().st_mtime:
+            shutil.copyfile(backbone_pdb, input_copy)
+
+    cmd = list(cfg.proteinmpnn_prefix)
+    if _is_cli_prefix(cmd, "proteinmpnn"):
+        cmd += [
+            "--input-dir",
+            str(input_dir),
+            "--output-dir",
+            str(output_dir),
+            "--loops",
+            loops,
+            "--seqs-per-struct",
+            str(seqs_per_struct),
+            "--temperature",
+            str(temperature),
+        ]
+        if cfg.proteinmpnn_weights:
+            cmd += ["--weights", str(cfg.proteinmpnn_weights)]
+    elif _is_script_prefix(cmd, "proteinmpnn_interface_design.py"):
+        cmd += [
+            "-pdbdir",
+            str(input_dir),
+            "-outpdbdir",
+            str(output_dir),
+            "-loop_string",
+            loops,
+            "-seqs_per_struct",
+            str(seqs_per_struct),
+            "-temperature",
+            str(temperature),
+        ]
+        if cfg.proteinmpnn_weights:
+            cmd += ["-checkpoint_path", str(cfg.proteinmpnn_weights)]
+    else:
+        raise PipelineError(
+            "Unsupported proteinmpnn command prefix. Expected CLI 'proteinmpnn' or script 'proteinmpnn_interface_design.py'."
+        )
+
+    code = run_command(cmd, log_path=log_file, dry_run=False, cwd=cfg.proteinmpnn_cwd)
+    if code != 0:
+        raise PipelineError(f"ProteinMPNN batch command failed; see {log_file}")
+
+    results: Dict[str, List[dict]] = {}
+    for backbone_pdb in backbone_pdbs:
+        output_pdbs = _collect_mpnn_outputs(output_dir, input_tag=backbone_pdb.stem)
+        if not output_pdbs:
+            raise PipelineError(f"ProteinMPNN produced no designed PDBs in {output_dir} for {backbone_pdb.stem}")
+        records: List[dict] = []
+        for i, pdb_path in enumerate(output_pdbs):
+            chain_id, seq = _chain_sequence_from_pdb(pdb_path)
+            records.append(
+                {
+                    "design_index": i,
+                    "designed_pdb": str(pdb_path),
+                    "chain_id": chain_id,
+                    "full_sequence": seq,
+                }
+            )
+        results[backbone_pdb.stem] = records
+    return results
+
+
 def run_rf2_filter(
     cfg: ToolConfig,
     input_pdb: Path,
@@ -754,6 +875,133 @@ def run_rf2_filter(
 
     out_json.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics
+
+
+def run_rf2_batch_filter(
+    cfg: ToolConfig,
+    records: Sequence[dict],
+    out_dir: Path,
+    dry_run: bool,
+    log_file: Path,
+    seed: int,
+    context: dict,
+) -> Dict[str, dict]:
+    """Run RF2 once for a batch of designed PDBs and parse per-candidate metrics.
+
+    Each record must include candidate_id, input_pdb, and out_json. The returned
+    mapping is keyed by candidate_id.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records = [dict(r) for r in records]
+    if not records:
+        return {}
+
+    if dry_run or not cfg.execute_real_tools:
+        out = {}
+        for rec in records:
+            cid = str(rec["candidate_id"])
+            out[cid] = run_rf2_filter(
+                cfg=cfg,
+                input_pdb=Path(str(rec["input_pdb"])),
+                sequence=str(rec.get("sequence", "")),
+                out_json=Path(str(rec["out_json"])),
+                dry_run=True,
+                log_file=log_file,
+                seed=seed,
+                context={**context, **dict(rec.get("context", {}) or {}), "candidate_id": cid},
+            )
+        return out
+
+    if not cfg.rf2_prefix:
+        raise PipelineError("execute_real_tools=true but rf2.command_prefix is empty")
+
+    input_dir = out_dir / "batch_input"
+    batch_out_dir = out_dir / "batch_outputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    batch_out_dir.mkdir(parents=True, exist_ok=True)
+
+    stem_by_cid: Dict[str, str] = {}
+    for rec in records:
+        cid = str(rec["candidate_id"])
+        src = Path(str(rec["input_pdb"]))
+        if not src.exists():
+            raise PipelineError(f"RF2 batch input PDB missing for {cid}: {src}")
+        safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", cid).strip("._-") or src.stem
+        dst = input_dir / f"{safe_stem}.pdb"
+        if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+            shutil.copyfile(src, dst)
+        stem_by_cid[cid] = safe_stem
+
+    batch_seed = deterministic_rng(seed, f"rf2_batch::{context.get('condition_name', 'condition')}").randint(1, 2_000_000_000)
+    cmd = list(cfg.rf2_prefix)
+    if _is_cli_prefix(cmd, "rf2"):
+        cmd += [
+            "--input-dir",
+            str(input_dir),
+            "--output-dir",
+            str(batch_out_dir),
+            "--num-recycles",
+            "10",
+            "--hotspot-show-prop",
+            "0.1",
+            "--seed",
+            str(batch_seed),
+            "--cautious",
+        ]
+        if cfg.rf2_weights:
+            cmd += ["--weights", str(cfg.rf2_weights)]
+    elif _is_script_prefix(cmd, "rf2_predict.py"):
+        cmd += [
+            f"input.pdb_dir={str(input_dir)}",
+            f"output.pdb_dir={str(batch_out_dir)}",
+            "inference.num_recycles=10",
+            "inference.cautious=True",
+            "inference.hotspot_show_proportion=0.1",
+            f"+inference.seed={batch_seed}",
+        ]
+        if cfg.rf2_weights:
+            cmd += [f"model.model_weights={str(cfg.rf2_weights)}"]
+    else:
+        raise PipelineError("Unsupported rf2 command prefix. Expected CLI 'rf2' or script 'rf2_predict.py'.")
+
+    code = run_command(cmd, log_path=log_file, dry_run=False, cwd=cfg.rf2_cwd)
+    if code != 0:
+        raise PipelineError(f"RF2 batch command failed; see {log_file}")
+
+    parsed: Dict[str, dict] = {}
+    for rec in records:
+        cid = str(rec["candidate_id"])
+        out_json = Path(str(rec["out_json"]))
+        best_pdb = _best_rf2_pdb_strict(batch_out_dir, input_stem=stem_by_cid[cid])
+        if best_pdb is None:
+            raise PipelineError(f"RF2 batch finished but no *_best.pdb was found for {cid} in {batch_out_dir}")
+        score_dict = _parse_rf2_scores(best_pdb)
+        interaction_pae = float(score_dict.get("interaction_pae", score_dict.get("pae", 99.0)))
+        rmsd = float(
+            score_dict.get(
+                "framework_aligned_cdr_rmsd",
+                score_dict.get(
+                    "framework_aligned_antibody_rmsd",
+                    score_dict.get("target_aligned_cdr_rmsd", score_dict.get("target_aligned_antibody_rmsd", 99.0)),
+                ),
+            )
+        )
+        pred_lddt = float(score_dict.get("pred_lddt", 0.0))
+        metrics = {
+            "rf2_pae": round(interaction_pae, 4),
+            "design_rf2_rmsd": round(rmsd, 4),
+            "rf2_interaction_pae": round(float(score_dict.get("interaction_pae", interaction_pae)), 4),
+            "rf2_mean_pae": round(float(score_dict.get("pae", interaction_pae)), 4),
+            "rf2_pred_lddt": round(pred_lddt, 4),
+            "structural_plausibility": round(max(0.0, min(1.0, pred_lddt)), 4),
+            "rf2_best_pdb": str(best_pdb),
+        }
+        for key, value in score_dict.items():
+            metrics[f"rf2_score_{key}"] = round(float(value), 4)
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_json.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        parsed[cid] = metrics
+    return parsed
 
 
 def _safe_float(value, default: Optional[float] = None) -> Optional[float]:

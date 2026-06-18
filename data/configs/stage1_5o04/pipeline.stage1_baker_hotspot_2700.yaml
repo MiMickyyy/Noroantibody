@@ -58,6 +58,8 @@ execution:
   dry_run_default: false
   resume_default: true
   max_gpu_parallel_jobs: 1
+  rfdiffusion_workers: 3
+  rfdiffusion_fallback_workers: [3, 2, 1]
   fail_fast: false
   memory_safe:
     cleanup_mode: "after_each_condition"
@@ -102,6 +104,17 @@ af3score:
     pae_max:
     ipsae_min:
     rank_score_min:
+
+rf2_async:
+  enabled: true
+  submit_script: "scripts/slurm/stage1_5o04_rf2_batch_async.sbatch"
+  partition: "short_gpu"
+  qos: "short_gpu"
+  time: "02:00:00"
+  gres: "gpu:a100:1"
+  cpus: 8
+  mem: "48G"
+  start_threshold_minutes: 60
 
 postprocess:
   sequence_dedup_identity_threshold: 0.95
