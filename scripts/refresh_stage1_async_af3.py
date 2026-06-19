@@ -22,7 +22,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from pipeline_common import read_yaml, resolve_path  # noqa: E402
+from pipeline_common import read_yaml  # noqa: E402
 from run_pipeline import af3score_validation_pass  # noqa: E402
 from tool_wrappers import _parse_af3score_metric_csv, _safe_float  # noqa: E402
 
@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cdr-config", default="data/configs/cdr_boundaries.yaml")
     p.add_argument("--no-merge", action="store_true")
     return p.parse_args()
+
+
+def resolve_path(root: Path, value: str | Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else root / path
 
 
 def read_csv_rows(path: Path) -> tuple[list[str], list[dict]]:
