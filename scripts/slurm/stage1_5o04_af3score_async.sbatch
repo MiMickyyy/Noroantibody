@@ -45,7 +45,8 @@ echo "AF3SCORE_GRES=${AF3SCORE_GRES}"
 bash scripts/hpcc/run_af3score_hpcc.sh "${AF3_ASYNC_INPUT_DIR}" "${AF3_ASYNC_OUTPUT_DIR}" "${AF3_ASYNC_NUM_JOBS}"
 
 if [[ -f scripts/refresh_stage1_async_af3.py ]]; then
-  output_root=$(python3 - "${AF3_ASYNC_OUTPUT_DIR}" <<'PY'
+  STAGE1_PYTHON=${STAGE1_PYTHON:-/rhome/xli616/.conda/envs/noro_rfantibody/bin/python}
+  output_root=$("${STAGE1_PYTHON}" - "${AF3_ASYNC_OUTPUT_DIR}" <<'PY'
 from pathlib import Path
 import sys
 p = Path(sys.argv[1]).resolve()
@@ -59,7 +60,7 @@ PY
     lock_file="${output_root}/af3score_async_refresh.lock"
     (
       flock -x 9
-      python3 scripts/refresh_stage1_async_af3.py \
+      "${STAGE1_PYTHON}" scripts/refresh_stage1_async_af3.py \
         --output-root "${output_root}" \
         --pipeline-config data/configs/stage1_5o04/pipeline.stage1_baker_hotspot_2700.yaml \
         --tooling-config data/configs/stage1_5o04/tooling.hpcc.yaml \
