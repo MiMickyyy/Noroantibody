@@ -429,6 +429,16 @@ def main() -> int:
         writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
+    failed_records = outputs_dir / "failed_records.txt"
+    if failed_records.exists():
+        archived = outputs_dir / "failed_records.upstream_ignored_after_fallback.txt"
+        failed_records.replace(archived)
+    marker = metrics_csv.parent / "af3score_fallback_metrics_ok.txt"
+    marker.write_text(
+        "Upstream 04_get_metrics.py did not emit rows, but AF3 confidence JSONs "
+        "were present and fallback metrics were written successfully.\n",
+        encoding="utf-8",
+    )
     print(f"[AF3Score HPCC adapter] Fallback wrote {len(rows)} metrics row(s): {metrics_csv}", flush=True)
     return 0
 
