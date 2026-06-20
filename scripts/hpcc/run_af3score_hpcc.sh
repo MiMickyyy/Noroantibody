@@ -81,6 +81,27 @@ if missing:
     raise SystemExit("Missing AF3Score Python dependencies:\n" + "\n".join(missing))
 PY
 
+"$AF3SCORE_PYTHON" - "$input_pdb_dir" <<'PY'
+from __future__ import annotations
+
+import shutil
+import sys
+from pathlib import Path
+
+input_dir = Path(sys.argv[1])
+for pdb in sorted(input_dir.glob("*.pdb")):
+    lower = pdb.with_name(pdb.name.lower())
+    if lower == pdb or lower.exists():
+        continue
+    try:
+        lower.symlink_to(pdb.name)
+    except Exception:
+        shutil.copyfile(pdb, lower)
+        print(f"[AF3Score HPCC adapter] Created lowercase PDB copy: {lower}", flush=True)
+    else:
+        print(f"[AF3Score HPCC adapter] Created lowercase PDB symlink: {lower} -> {pdb.name}", flush=True)
+PY
+
 runtime_dir="$output_dir/_af3score_hpcc_runtime"
 rm -rf "$runtime_dir"
 mkdir -p "$runtime_dir"
@@ -472,5 +493,21 @@ set -e
 "$AF3SCORE_PYTHON" "$runtime_dir/05_fallback_metrics.py" \
   "$output_dir/af3score_metrics.csv" \
   "$output_dir/af3score_outputs"
+
+if "$AF3SCORE_PYTHON" - "$output_dir/af3score_metrics.csv" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists() or path.stat().st_size == 0:
+    raise SystemExit(1)
+with path.open("r", encoding="utf-8", newline="") as handle:
+    rows = list(csv.DictReader(handle))
+raise SystemExit(0 if rows else 1)
+PY
+then
+  exit 0
+fi
 
 exit "$pipeline_status"
