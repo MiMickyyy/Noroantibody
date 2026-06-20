@@ -28,6 +28,17 @@ export AF3SCORE_CUDA_MODULE=${AF3SCORE_CUDA_MODULE:-cuda/12.8}
 export AF3SCORE_FLASH_ATTENTION=${AF3SCORE_FLASH_ATTENTION:-xla}
 export AF3SCORE_DB_DIR=${AF3SCORE_DB_DIR:-/bigdata/operations/pkgadmin/srv/projects/db/alphafold/3.0.0}
 export AF3SCORE_MODEL_DIR=${AF3SCORE_MODEL_DIR:-${AF3SCORE_DB_DIR}/model}
+if [[ -z "${AF3SCORE_EXCLUDE:-}" ]]; then
+  AF3SCORE_EXCLUDE=$(
+    squeue -h -u "${USER}" -o "%j|%N" \
+      | awk -F'|' '$1=="noro_baker2700_a100" || $1=="noro_baker2700_tail60" {print $2}' \
+      | tr ',' '\n' \
+      | grep -Ev '^$|^\\(null\\)$' \
+      | sort -u \
+      | paste -sd, -
+  )
+fi
+export AF3SCORE_EXCLUDE
 
 mkdir -p "${AF3_ASYNC_OUTPUT_DIR}"
 
@@ -41,6 +52,7 @@ echo "AF3SCORE_PARTITION=${AF3SCORE_PARTITION}"
 echo "AF3SCORE_QOS=${AF3SCORE_QOS}"
 echo "AF3SCORE_TIME=${AF3SCORE_TIME}"
 echo "AF3SCORE_GRES=${AF3SCORE_GRES}"
+echo "AF3SCORE_EXCLUDE=${AF3SCORE_EXCLUDE}"
 
 bash scripts/hpcc/run_af3score_hpcc.sh "${AF3_ASYNC_INPUT_DIR}" "${AF3_ASYNC_OUTPUT_DIR}" "${AF3_ASYNC_NUM_JOBS}"
 
