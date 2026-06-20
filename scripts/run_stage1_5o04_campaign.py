@@ -107,6 +107,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resolved-targets", default="data/configs/stage1_5o04/resolved_targets.full_target.yaml")
     p.add_argument("--cdr-config", default="data/configs/cdr_boundaries.yaml")
     p.add_argument("--condition-index", type=int, default=None)
+    p.add_argument("--condition-start-index", type=int, default=None)
+    p.add_argument("--condition-end-index", type=int, default=None)
     p.add_argument("--max-conditions", type=int, default=None)
     p.add_argument("--backbones-per-condition", type=int, default=20)
     p.add_argument("--seqs-per-backbone", type=int, default=1)
@@ -1684,10 +1686,23 @@ def main() -> int:
         return 0
 
     selected = conditions
+    if args.condition_index is not None and (
+        args.condition_start_index is not None or args.condition_end_index is not None
+    ):
+        raise PipelineError("--condition-index cannot be combined with condition range arguments")
     if args.condition_index is not None:
         selected = [c for c in conditions if c.condition_index == int(args.condition_index)]
         if not selected:
             raise PipelineError(f"Unknown condition index: {args.condition_index}")
+    elif args.condition_start_index is not None or args.condition_end_index is not None:
+        start = 0 if args.condition_start_index is None else int(args.condition_start_index)
+        end = max(c.condition_index for c in conditions) if args.condition_end_index is None else int(args.condition_end_index)
+        if start > end:
+            raise PipelineError(f"Invalid condition range: start {start} > end {end}")
+        selected = [c for c in conditions if start <= c.condition_index <= end]
+        if not selected:
+            raise PipelineError(f"No conditions selected by range {start}-{end}")
+        log(f"运行 condition range {start}-{end}: {len(selected)} conditions")
 
     for condition in selected:
         log(f"运行 condition {condition.condition_index}: {condition.condition_name}")
